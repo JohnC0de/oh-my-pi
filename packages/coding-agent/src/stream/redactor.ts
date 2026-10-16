@@ -1,3 +1,5 @@
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { getAgentDir, getDotenvEnvValues, logger } from "@oh-my-pi/pi-utils";
 import { builtinCredentialSecretEntries, collectEnvSecrets, loadSecrets } from "../secrets";
 import { CREDENTIAL_PREFIX_RULES } from "../secrets/patterns";
@@ -9,7 +11,7 @@ const MIN_PLAIN_SECRET_LENGTH = 8;
 const MIN_TYPED_PREFIX_LENGTH = 6;
 const SECRET_NAME_RE = /(KEY|SECRET|TOKEN|PASSWORD|PASSWD|PASS|AUTH|CREDENTIAL|PRIVATE|OAUTH)(_|$)/i;
 const ASSIGNMENT_RE =
-	/["']?([A-Za-z_][A-Za-z0-9_]*)["']?\s*(?:=|:)\s*((?:"(?:\\[\s\S]|[^"\\])*"|'[^']*'|\\[\s\S]|[^\s"'\\;|&<>])+)/g;
+	/(?:(["'])([A-Za-z_][A-Za-z0-9_]*)\1\s*:\s*((?:"(?:\\[\s\S]|[^"\\])*"|'[^']*'|[^\s,}])+)|([A-Za-z_][A-Za-z0-9_]*)\s*(=|:)\s*((?:"(?:\\[\s\S]|[^"\\])*"|'[^']*'|\\[\s\S]|[^\s"'\\;|&<>])+)|(["'])([A-Za-z_][A-Za-z0-9_]*)\7\]?\s*=\s*((?:"(?:\\[\s\S]|[^"\\])*"|'[^']*'|\\[\s\S]|[^\s"'\\;|&<>])+))/g;
 const CONNECTION_URL_RE = /[a-z][a-z0-9+.-]*:\/\/[^/:@?#\s]*:([^/?#@\s]+)@/gi;
 
 interface PlainSecret {
@@ -68,6 +70,32 @@ export class StreamRedactor {
 		return new StreamRedactor(patterns, plainSecrets);
 	}
 
+	/** Invalidate metadata caching on source-file or process-environment changes. */
+	static async cacheKey(cwd: string): Promise<string> {
+		const mode = process.env.NODE_ENV;
+		const modes =
+			mode !== undefined && mode !== "" && mode !== "development" ? ["development", mode] : ["development"];
+		const files = [
+			path.join(cwd, ".omp", "secrets.yml"),
+			path.join(getAgentDir(), "secrets.yml"),
+			path.join(cwd, ".env"),
+			path.join(cwd, ".env.local"),
+			...modes.flatMap(mode => [path.join(cwd, `.env.${mode}`), path.join(cwd, `.env.${mode}.local`)]),
+		];
+		const stamps = await Promise.all(
+			files.map(async file => {
+				try {
+					const stat = await fs.stat(file, { bigint: true });
+					return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return "missing";
+					throw error;
+				}
+			}),
+		);
+		return `${cwd}:${Bun.hash(JSON.stringify(process.env))}:${stamps.join("|")}`;
+	}
+
 	/** Redact shell words before rendering command metadata, including nested shell argv. */
 	redactCommand(command: string): string {
 		const redacted = lexShellCommand(command, { decodeAnsiC: true })
@@ -118,8 +146,12 @@ export class StreamRedactor {
 		ASSIGNMENT_RE.lastIndex = 0;
 		let assignment: RegExpExecArray | null;
 		while ((assignment = ASSIGNMENT_RE.exec(plain)) !== null) {
-			if (!SECRET_NAME_RE.test(assignment[1])) continue;
-			const value = assignment[2];
+			const name = assignment[2] ?? assignment[4] ?? assignment[8];
+			if (!SECRET_NAME_RE.test(name)) continue;
+			// Generic JSON "key" fields and unquoted PASS: counts are not credentials.
+			if (assignment[1] && name.toLowerCase() === "key") continue;
+			const value = assignment[3] ?? assignment[6] ?? assignment[9];
+			if (assignment[5] === ":" && value.replace(/^["']|["']$/g, "").length < 4) continue;
 			const start = assignment.index + assignment[0].lastIndexOf(value);
 			spans.push(start, start + value.length);
 		}

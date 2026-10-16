@@ -71,6 +71,21 @@ function cx(kinds: readonly TspKind[]): DescribeContext {
 }
 
 describe("bash native run box", () => {
+	it("uses the worktree rewrite command in its header and copy payload", () => {
+		const executedCommand = "/opt/omp worktree add --detach ../linked HEAD";
+		const view = bashToolRenderer.describeResult(
+			{
+				content: [{ type: "text", text: "created" }],
+				details: { execution: { executedCommand, rewriteKind: "worktree-add" } },
+			},
+			done,
+			{ command: "git worktree add --detach ../linked HEAD" },
+		);
+		expect(view.tool).toMatchObject({ title: "git worktree add → omp worktree add", command: executedCommand });
+		const box = nodes(view.body)[0];
+		expect(props(nodes(box?.c)[0]).text).toBe(executedCommand);
+	});
+
 	it("names the intent in the head and draws command, output and settled foot in one box", () => {
 		const view = bashToolRenderer.describeResult(
 			{

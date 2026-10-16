@@ -50,6 +50,7 @@ export default class Worktree extends Command {
 			description: "Detach HEAD (add)",
 			default: false,
 		}),
+		"keep-changes": Flags.boolean({ description: "Preserve uncommitted source changes (add)", default: false }),
 		quiet: Flags.boolean({
 			char: "q",
 			description: "Suppress add output",
@@ -98,6 +99,8 @@ export default class Worktree extends Command {
 					forceBranch: flags["force-branch"],
 					detach: flags.detach ?? false,
 					quiet: flags.quiet ?? false,
+					json: flags.json ?? false,
+					keepChanges: flags["keep-changes"] ?? false,
 				});
 			} catch (error) {
 				console.error(error instanceof Error ? error.message : String(error));

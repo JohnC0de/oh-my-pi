@@ -61,6 +61,27 @@ pub struct CloneStats {
 	pub total_ms:            f64,
 	pub policy_ms:           f64,
 	pub reconcile_ms:        f64,
+	pub traversal_ms:        f64,
+	pub copy_ms:             f64,
+	pub register_ms:         f64,
+	pub branch_ms:           f64,
+	pub checkout_ms:         f64,
+	pub manifest:            CloneManifest,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CloneManifest {
+	pub copied:   Vec<ClonePath>,
+	pub excluded: Vec<ClonePath>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClonePath {
+	pub path:            String,
+	pub files:           u64,
+	pub bytes:           u64,
+	/// False for pruned directories whose private contents were not traversed.
+	pub counts_measured: bool,
 }
 
 /// A failed clone retains the work measured before the backend returned its
@@ -68,7 +89,7 @@ pub struct CloneStats {
 #[derive(Debug, Clone)]
 pub struct CloneError {
 	pub error: IsoError,
-	pub stats: CloneStats,
+	pub stats: Box<CloneStats>,
 }
 
 impl CloneError {

@@ -49,8 +49,31 @@ describe("StreamRedactor", () => {
 		expect(redactor.redactRow(row)).toBe(row);
 	});
 
+	it("preserves source-location JSON and short non-secret status counts", () => {
+		const isolated = new StreamRedactor([], []);
+		for (const row of ['{"key":"src/a.ts","line":10,"msg":"unused"}', "PASS: 42"]) {
+			expect(isolated.redactRow(row)).toBe(row);
+		}
+		expect(isolated.redactRow('{"API_KEY":"abcd1234","line":10}')).toBe('{"API_KEY":••••••,"line":10}');
+	});
+
 	it("redacts only the value in a secret assignment", () => {
 		expect(redactor.redactRow("prefix API_KEY=abcd1234 suffix")).toBe("prefix API_KEY=•••••• suffix");
+	});
+
+	it.each([
+		["export DB_PASSWORD=sample,comma-value", "export DB_PASSWORD=••••••"],
+		["TOKEN=abc,synthetic-value", "TOKEN=••••••"],
+		["API_KEY=xy{synthetic-value}", "API_KEY=••••••"],
+		["PASSWORD=ab}synthetic-value", "PASSWORD=••••••"],
+		["TOKEN=abc", "TOKEN=••••••"],
+		['"AUTH_TOKEN"=synthetic,value}', '"AUTH_TOKEN"=••••••'],
+		['env["API_KEY"]=synthetic,value}', 'env["API_KEY"]=••••••'],
+		["env['API_KEY']='synthetic value'", "env['API_KEY']=••••••"],
+		['{"TOKEN":abc,"line":10}', '{"TOKEN":••••••,"line":10}'],
+		['{"API_KEY":"xy{synthetic,value}","line":10}', '{"API_KEY":••••••,"line":10}'],
+	])("redacts punctuation without consuming adjacent JSON fields: %s", (input, expected) => {
+		expect(new StreamRedactor([], []).redactRow(input)).toBe(expected);
 	});
 
 	it("redacts an opaque assignment argv element without leaking its whitespace-delimited suffix", () => {

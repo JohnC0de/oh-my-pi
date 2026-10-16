@@ -27,7 +27,7 @@ pub(crate) fn measure_clone(
 	measured.total_ms = started.elapsed().as_secs_f64() * 1000.0;
 	match result {
 		Ok(()) => Ok(measured),
-		Err(error) => Err(crate::CloneError { error, stats: measured }),
+		Err(error) => Err(crate::CloneError { error, stats: Box::new(measured) }),
 	}
 }
 
@@ -83,6 +83,25 @@ pub fn validate_destination(source: &Path, destination: &Path) -> IsoResult<()> 
 	}
 	let source = resolve(source).map_err(|err| IsoError::other(err.to_string()))?;
 	let destination = resolve(destination).map_err(|err| IsoError::other(err.to_string()))?;
+	#[cfg(unix)]
+	let file_identity = |path: &Path| -> io::Result<(u64, u64)> {
+		use std::os::unix::fs::MetadataExt;
+		let metadata = fs::metadata(path)?;
+		Ok((metadata.dev(), metadata.ino()))
+	};
+	#[cfg(not(unix))]
+	let file_identity = |path: &Path| same_file::Handle::from_path(path);
+	let identity = file_identity(&source).map_err(|err| IsoError::other(err.to_string()))?;
+	for ancestor in destination.ancestors() {
+		match file_identity(ancestor) {
+			Ok(handle) if handle == identity => {
+				return Err(IsoError::other("source and destination trees overlap (file identity)"));
+			},
+			Ok(_) => {},
+			Err(err) if err.kind() == io::ErrorKind::NotFound => {},
+			Err(err) => return Err(IsoError::other(err.to_string())),
+		}
+	}
 	if destination.starts_with(&source) || source.starts_with(&destination) {
 		return Err(IsoError::other("source and destination trees overlap"));
 	}
@@ -165,7 +184,9 @@ pub fn copy_dir_contents(
 	copy: &impl TreeCopy,
 ) -> IsoResult<()> {
 	let skip = skip.iter().map(Path::new).collect();
-	copy_dir_contents_at(src, src, dst, &skip, copy)
+	let destination =
+		same_file::Handle::from_path(dst).map_err(|err| IsoError::other(err.to_string()))?;
+	copy_dir_contents_at(src, src, dst, &skip, copy, &destination)
 }
 
 fn copy_dir_contents_at(
@@ -174,38 +195,98 @@ fn copy_dir_contents_at(
 	dst: &Path,
 	skip: &std::collections::BTreeSet<&Path>,
 	copy: &impl TreeCopy,
+	destination: &same_file::Handle,
 ) -> IsoResult<()> {
 	record(|stats| stats.traversal_measured = true);
-	let entries = fs::read_dir(src)
+	let started = std::time::Instant::now();
+	let mut entries = fs::read_dir(src)
 		.map_err(|err| IsoError::other(format!("read_dir {}: {err}", src.display())))?;
-	for entry in entries {
+	record(|stats| {
+		stats.traversal_ms = started
+			.elapsed()
+			.as_secs_f64()
+			.mul_add(1000.0, stats.traversal_ms);
+	});
+	loop {
+		let started = std::time::Instant::now();
+		let Some(entry) = entries.next() else {
+			record(|stats| {
+				stats.traversal_ms = started
+					.elapsed()
+					.as_secs_f64()
+					.mul_add(1000.0, stats.traversal_ms);
+			});
+			break;
+		};
 		let entry =
 			entry.map_err(|err| IsoError::other(format!("dir entry in {}: {err}", src.display())))?;
-		let name = entry.file_name();
-		record(|stats| stats.entries_visited += 1);
-		if skip.contains(entry.path().strip_prefix(root).unwrap()) {
-			record(|stats| stats.entries_skipped += 1);
-			continue;
-		}
 		let src_path = entry.path();
 		let file_type = entry
 			.file_type()
 			.map_err(|err| IsoError::other(format!("file_type {}: {err}", src_path.display())))?;
-		let dst_path = dst.join(&name);
-		if file_type.is_symlink() {
-			copy.symlink(&src_path, &dst_path, file_type)?;
-			record(|stats| stats.symlinks_copied += 1);
-		} else if file_type.is_dir() {
+		let excluded = skip.contains(src_path.strip_prefix(root).unwrap())
+			|| (file_type.is_dir()
+				&& same_file::Handle::from_path(&src_path)
+					.map_err(|err| IsoError::other(err.to_string()))?
+					== *destination);
+		let bytes = if file_type.is_file() {
+			entry
+				.metadata()
+				.map_err(|err| IsoError::other(err.to_string()))?
+				.len()
+		} else {
+			0
+		};
+		record(|stats| {
+			stats.entries_visited += 1;
+			stats.traversal_ms = started
+				.elapsed()
+				.as_secs_f64()
+				.mul_add(1000.0, stats.traversal_ms);
+		});
+		if excluded {
+			record(|stats| stats.entries_skipped += 1);
+			continue;
+		}
+		let dst_path = dst.join(entry.file_name());
+		let started = std::time::Instant::now();
+		if file_type.is_dir() {
 			fs::create_dir_all(&dst_path)
 				.map_err(|err| IsoError::other(format!("create {}: {err}", dst_path.display())))?;
-			record(|stats| stats.directories_created += 1);
-			copy_dir_contents_at(root, &src_path, &dst_path, skip, copy)?;
-			copy.finish_dir(&src_path, &dst_path)?;
+			record(|stats| {
+				stats.directories_created += 1;
+				stats.copy_ms = started
+					.elapsed()
+					.as_secs_f64()
+					.mul_add(1000.0, stats.copy_ms);
+			});
+			copy_dir_contents_at(root, &src_path, &dst_path, skip, copy, destination)?;
+			let started = std::time::Instant::now();
+			let result = copy.finish_dir(&src_path, &dst_path);
+			record(|stats| {
+				stats.copy_ms = started
+					.elapsed()
+					.as_secs_f64()
+					.mul_add(1000.0, stats.copy_ms);
+			});
+			result?;
 		} else {
-			copy.file(&src_path, &dst_path, file_type)?;
+			let result = if file_type.is_symlink() {
+				copy.symlink(&src_path, &dst_path, file_type)
+			} else {
+				copy.file(&src_path, &dst_path, file_type)
+			};
+			record(|stats| {
+				stats.copy_ms = started
+					.elapsed()
+					.as_secs_f64()
+					.mul_add(1000.0, stats.copy_ms);
+			});
+			result?;
 			record(|stats| {
 				stats.files_copied += u64::from(file_type.is_file());
-				stats.bytes_copied += fs::metadata(&src_path).map_or(0, |meta| meta.len());
+				stats.symlinks_copied += u64::from(file_type.is_symlink());
+				stats.bytes_copied += bytes;
 			});
 		}
 	}
@@ -240,6 +321,40 @@ mod tests {
 		fn finish_dir(&self, _src: &Path, _dst: &Path) -> IsoResult<()> {
 			Ok(())
 		}
+	}
+
+	#[test]
+	fn traversal_skips_destination_identity_even_without_preflight() {
+		let source =
+			std::env::temp_dir().join(format!("pi-iso-runtime-destination-{}", std::process::id()));
+		let destination = source.join("destination");
+		fs::create_dir_all(&destination).unwrap();
+		fs::write(source.join("payload"), b"payload").unwrap();
+		let stats = measure_clone(|| {
+			copy_dir_contents(&source, &destination, &[], &FailSecondFile(Cell::new(0)))
+		})
+		.unwrap();
+		assert_eq!(stats.files_copied, 1);
+		assert_eq!(stats.entries_skipped, 1);
+		assert_eq!(fs::read(destination.join("payload")).unwrap(), b"payload");
+		assert!(!destination.join("destination").exists());
+		fs::remove_dir_all(source).unwrap();
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn destination_under_search_only_parent_is_valid() {
+		use std::os::unix::fs::PermissionsExt;
+		let root = std::env::temp_dir().join(format!("pi-iso-search-only-{}", std::process::id()));
+		let source = root.join("source");
+		let parent = root.join("parent");
+		fs::create_dir_all(&source).unwrap();
+		fs::create_dir(&parent).unwrap();
+		fs::set_permissions(&parent, fs::Permissions::from_mode(0o311)).unwrap();
+		let result = validate_destination(&source, &parent.join("destination"));
+		fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+		fs::remove_dir_all(root).unwrap();
+		result.unwrap();
 	}
 
 	#[test]

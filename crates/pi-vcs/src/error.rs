@@ -98,7 +98,7 @@ pub enum Error {
 	#[error("{source}")]
 	WorktreeAdd {
 		#[source]
-		source:         Box<Error>,
+		source:         Box<Self>,
 		clone_attempts: Vec<crate::types::WorktreeCloneAttempt>,
 	},
 

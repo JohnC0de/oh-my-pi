@@ -142,6 +142,7 @@ describe("BashTool ACP terminal routing", () => {
 		]);
 		expect(result.details?.execution).toMatchObject({
 			rewritten: true,
+			rewriteKind: "transform",
 			terminalId: "trace-terminal",
 			pidStatus: "unavailable",
 			dispatch: {
@@ -176,10 +177,13 @@ describe("BashTool ACP terminal routing", () => {
 		expect(result.details?.execution).toMatchObject({
 			requestedCommand: "true ••••••",
 			executedCommand: "true ••••••",
+			rewritten: false,
+			rewriteKind: "wrapper",
 			dispatch: { command: "true ••••••", argv: ["-l", "-c", "true ••••••"] },
 		});
 		expect(JSON.stringify(result)).not.toContain("synthetic");
 		expect(JSON.stringify(result)).not.toContain("\\x6e");
+		expect(result.content.find(block => block.type === "text")?.text).not.toContain("[Command rewritten]");
 	});
 
 	it("extracts graphics from cumulative terminal snapshots without leaking escapes", async () => {

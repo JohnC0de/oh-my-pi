@@ -28,6 +28,22 @@ describe("bashToolRenderer", () => {
 		terminal.imageProtocol = originalProtocol;
 	});
 
+	it("labels a worktree rewrite and shows the executed command", () => {
+		const executedCommand = "/opt/omp worktree add --detach ../linked HEAD";
+		const component = bashToolRenderer.renderResult(
+			{
+				content: [{ type: "text", text: "created" }],
+				details: { execution: { executedCommand, rewriteKind: "worktree-add" } },
+			},
+			{ expanded: true, isPartial: false },
+			uiTheme,
+			{ command: "git worktree add --detach ../linked HEAD" },
+		);
+		const rendered = sanitizeText(component.render(160).join("\n"));
+		expect(rendered).toContain("git worktree add → omp worktree add");
+		expect(rendered).toContain(executedCommand);
+	});
+
 	it("shows rendered env assignments in the command preview", async () => {
 		const component = bashToolRenderer.renderCall(
 			{ command: "printf '%s' \"$MERMAID\"", env: { MERMAID: 'line "one"\ntwo' } },

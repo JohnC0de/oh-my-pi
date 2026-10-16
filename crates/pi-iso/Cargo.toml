@@ -14,6 +14,7 @@ workspace = true
 async-trait.workspace = true
 similar.workspace = true
 tokio.workspace = true
+same-file = "1.0.6"
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

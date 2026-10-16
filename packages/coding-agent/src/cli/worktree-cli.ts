@@ -27,7 +27,7 @@ import { hasLiveIsolationOwner, ISOLATION_OWNER_FILE, readRetainedMountBackend }
 import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
 import { resolveSyscallTarget } from "../tools/path-utils";
 
-import { cfgIsolationBackend, cfgWorktreeClone } from "../task/settings";
+import { cfgIsolationBackend, cfgWorktreeClone, cfgWorktreeInclude } from "../task/settings";
 
 type WorktreeKind = "pr-checkout" | "task-isolation" | "empty" | "stray";
 
@@ -54,6 +54,8 @@ export interface AddWorktreeOptions {
 	forceBranch?: string;
 	detach: boolean;
 	quiet: boolean;
+	json?: boolean;
+	keepChanges?: boolean;
 }
 
 export interface ListWorktreesOptions {
@@ -97,11 +99,16 @@ export async function stopRetainedMount(dir: string): Promise<boolean> {
 	return false;
 }
 
-/** Native phase timings are disjoint; bulk-clone backends do not enumerate entries. */
+/** Phase timings and payload counts; policy and clone totals enclose their subphases. */
 export function formatWorktreeCloneStats(stats: {
 	totalMs: number;
 	policyMs: number;
 	reconcileMs: number;
+	traversalMs?: number;
+	copyMs?: number;
+	registerMs?: number;
+	branchMs?: number;
+	checkoutMs?: number;
 	traversalMeasured: boolean;
 	entriesVisited: number;
 	directoriesCreated: number;
@@ -110,9 +117,17 @@ export function formatWorktreeCloneStats(stats: {
 	symlinksCopied: number;
 	entriesSkipped: number;
 }): string {
-	const timings = `Clone timing: policy=${stats.policyMs.toFixed(2)}ms clone=${stats.totalMs.toFixed(2)}ms reconcile=${stats.reconcileMs.toFixed(2)}ms`;
-	if (!stats.traversalMeasured) return `${timings}; traversal counters unavailable for bulk backend`;
+	const timings = `Clone timing: policy=${stats.policyMs.toFixed(2)}ms clone=${stats.totalMs.toFixed(2)}ms traversal=${(stats.traversalMs ?? 0).toFixed(2)}ms copy=${(stats.copyMs ?? 0).toFixed(2)}ms register=${(stats.registerMs ?? 0).toFixed(2)}ms branch=${(stats.branchMs ?? 0).toFixed(2)}ms reconcile=${stats.reconcileMs.toFixed(2)}ms checkout=${(stats.checkoutMs ?? 0).toFixed(2)}ms`;
+	if (!stats.traversalMeasured)
+		return `${timings}; backend traversal unmeasured; manifest files=${stats.filesCopied} bytes=${stats.bytesCopied}`;
 	return `${timings}; visited=${stats.entriesVisited} directories=${stats.directoriesCreated} files=${stats.filesCopied} bytes=${stats.bytesCopied} symlinks=${stats.symlinksCopied} skipped=${stats.entriesSkipped}`;
+}
+
+export function formatWorktreeManifestSummary(manifest: natives.VcsCloneManifest): string {
+	const files = manifest.copied.reduce((sum, entry) => sum + entry.files, 0);
+	const bytes = manifest.copied.reduce((sum, entry) => sum + entry.bytes, 0);
+	const unmeasured = manifest.excluded.filter(entry => !entry.countsMeasured).length;
+	return `Copy summary: files=${files} bytes=${bytes}; excluded roots=${manifest.excluded.length} (${unmeasured} unmeasured); full manifest: --json`;
 }
 
 export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
@@ -136,6 +151,18 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	if (contains(source, destination) || contains(destination, source)) {
 		throw new Error("fatal: source and destination trees overlap");
 	}
+	const sourceStat = await fs.stat(source, { bigint: true });
+	for (let ancestor = destination; ; ancestor = path.dirname(ancestor)) {
+		try {
+			const stat = await fs.stat(ancestor, { bigint: true });
+			if (stat.dev === sourceStat.dev && stat.ino === sourceStat.ino) {
+				throw new Error("fatal: source and destination trees overlap (file identity)");
+			}
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+		if (ancestor === path.dirname(ancestor)) break;
+	}
 	try {
 		const stat = await fs.stat(worktreePath);
 		const nonEmpty = !stat.isDirectory() || (await fs.readdir(worktreePath)).length > 0;
@@ -148,12 +175,22 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	let ref: string;
 	let detach = false;
 	let createdBranch: string | undefined;
+	let removeBranchOnFailure: string | undefined;
+	let restoreBranchOnFailure: { name: string; sha: string } | undefined;
+	let branchMs = 0;
 	if (options.branch || options.forceBranch) {
 		const branch = options.branch ?? options.forceBranch;
 		if (!branch) throw new Error("branch name is required");
+		const existed = await repository.refExists(`refs/heads/${branch}`);
+		if (existed && options.forceBranch) {
+			restoreBranchOnFailure = { name: branch, sha: (await repository.commitDetails(branch)).sha };
+		}
+		const started = performance.now();
 		await repository.createBranch(branch, options.commit ?? "HEAD", Boolean(options.forceBranch));
+		branchMs += performance.now() - started;
 		ref = branch;
 		createdBranch = branch;
+		if (!existed) removeBranchOnFailure = branch;
 	} else if (options.detach) {
 		ref = options.commit ?? "HEAD";
 		detach = true;
@@ -163,8 +200,11 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	} else {
 		const branch = path.basename(worktreePath);
 		if (!(await repository.refExists(`refs/heads/${branch}`))) {
+			const started = performance.now();
 			await repository.createBranch(branch, "HEAD", false);
+			branchMs += performance.now() - started;
 			createdBranch = branch;
+			removeBranchOnFailure = branch;
 		}
 		ref = branch;
 	}
@@ -172,7 +212,7 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	const commit = await repository.commitDetails(ref);
 	const shortSha = commit.sha.slice(0, 7);
 	const subject = commit.message.split("\n", 1)[0];
-	if (!options.quiet) {
+	if (!options.quiet && !options.json) {
 		const preparation = createdBranch
 			? `new branch '${createdBranch}'`
 			: detach
@@ -180,12 +220,28 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 				: `checking out '${ref}'`;
 		console.log(`Preparing worktree (${preparation})`);
 	}
-	const result = await repository.worktreeAdd(worktreePath, ref, {
-		detach,
-		clone: cfgWorktreeClone.get(settings),
-		backend: parseIsolationBackend(cfgIsolationBackend.get(settings)),
-	});
-	if (!options.quiet) {
+	let result;
+	try {
+		result = await repository.worktreeAdd(worktreePath, ref, {
+			detach,
+			clone: cfgWorktreeClone.get(settings),
+			backend: parseIsolationBackend(cfgIsolationBackend.get(settings)),
+			include: cfgWorktreeInclude.get(settings),
+			keepChanges: options.keepChanges ?? false,
+		});
+	} catch (error) {
+		if (removeBranchOnFailure) await repository.deleteBranch(removeBranchOnFailure, true);
+		if (restoreBranchOnFailure) {
+			await repository.createBranch(restoreBranchOnFailure.name, restoreBranchOnFailure.sha, true);
+		}
+		throw error;
+	}
+	if (result.cloneStats) result.cloneStats.branchMs += branchMs;
+	for (const attempt of result.cloneAttempts) attempt.stats.branchMs += branchMs;
+	if (options.json) {
+		await Bun.write(Bun.stdout, `${JSON.stringify({ path: worktreePath, commit: commit.sha, ...result })}\n`);
+	}
+	if (!options.quiet && !options.json) {
 		console.log(`HEAD is now at ${shortSha} ${subject}`);
 		if (result.clonedWith != null) {
 			console.log(`Cloned from ${repository.info().repoRoot} via ${formatIsolationBackend(result.clonedWith)}`);
@@ -194,6 +250,10 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 			console.log(
 				`Clone attempt (${formatIsolationBackend(attempt.backend)}, ${attempt.outcome}): elapsed=${attempt.elapsedMs.toFixed(2)}ms cleanup=${attempt.cleanupMs.toFixed(2)}ms; ${formatWorktreeCloneStats(attempt.stats)}`,
 			);
+		}
+		if (result.cloneStats) {
+			console.log(formatWorktreeCloneStats(result.cloneStats));
+			console.log(formatWorktreeManifestSummary(result.cloneStats.manifest));
 		}
 	}
 	if (result.cloneError) {

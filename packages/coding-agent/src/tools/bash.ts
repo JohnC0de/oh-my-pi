@@ -420,6 +420,10 @@ export interface BashExecutionTrace {
 	requestedCommand: string;
 	executedCommand: string;
 	rewritten: boolean;
+	rewriteKind?: "worktree-add" | "wrapper" | "transform";
+	parentPid: number;
+	parentExe: string;
+	jobUnavailableReason?: string;
 	ownerSessionId?: string;
 	ownerAgentId?: string;
 	pids?: readonly number[];
@@ -523,6 +527,7 @@ function formatTimeoutClampNotice(
  */
 export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	readonly name = "bash";
+	#metadataRedactor?: { key: string; value: Promise<StreamRedactor> };
 	/** Bash reads `skill://` paths through its shell filesystem, including as a working directory. */
 	readonly readsSkillUris = true;
 	readonly approval = (args: unknown): ToolApprovalDecision => {
@@ -964,6 +969,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			},
 		);
 		options.trace.jobId = jobId;
+		delete options.trace.jobUnavailableReason;
 
 		return {
 			jobId,
@@ -989,11 +995,22 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				? router.normalize(effectiveCwd)
 				: resolveToCwd(effectiveCwd, this.session.cwd)
 			: this.session.cwd;
-		const redactor = await StreamRedactor.load(redactionCwd, []);
+		const redactionKey = await StreamRedactor.cacheKey(redactionCwd);
+		if (this.#metadataRedactor?.key !== redactionKey) {
+			this.#metadataRedactor = { key: redactionKey, value: StreamRedactor.load(redactionCwd, []) };
+		}
+		const cachedRedactor = this.#metadataRedactor;
+		const redactor = await cachedRedactor.value.catch(error => {
+			if (this.#metadataRedactor === cachedRedactor) this.#metadataRedactor = undefined;
+			throw error;
+		});
 		const trace: BashExecutionTrace = {
 			requestedCommand: redactor.redactCommand(input.command),
 			executedCommand: redactor.redactCommand(input.command),
 			rewritten: false,
+			parentPid: process.pid,
+			parentExe: process.execPath,
+			jobUnavailableReason: "Foreground execution is not registered as a managed job.",
 			ownerSessionId: this.session.getSessionId?.() ?? undefined,
 			ownerAgentId: this.session.getAgentId?.() ?? undefined,
 			pidStatus: "unavailable",
@@ -1002,7 +1019,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		};
 		const onDispatch = (dispatch: BashDispatch) => {
 			trace.executedCommand = redactor.redactCommand(dispatch.command);
-			trace.rewritten = dispatch.command !== input.command || dispatch.program !== null;
+			trace.rewritten = dispatch.command !== input.command;
+			trace.rewriteKind =
+				trace.rewriteKind === "worktree-add"
+					? "worktree-add"
+					: trace.rewritten
+						? "transform"
+						: dispatch.program !== null
+							? "wrapper"
+							: undefined;
 			trace.dispatch = {
 				...dispatch,
 				command: trace.executedCommand,
@@ -1024,11 +1049,14 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						trace.ownerAgentId && `agent=${trace.ownerAgentId}`,
 						trace.jobId && `job=${trace.jobId}`,
 						trace.pids?.length && `pids=${trace.pids.join(",")}`,
+						`parent=${trace.parentPid} (${trace.parentExe})`,
 						trace.terminalId && `terminal=${trace.terminalId}`,
 					]
 						.filter(Boolean)
 						.join(" ") || "unavailable";
-				const notice = `[Command rewritten]\nRequested: ${trace.requestedCommand}\nExecuted: ${trace.executedCommand}\nIdentity: ${identity}`;
+				const label =
+					trace.rewriteKind === "worktree-add" ? "[git worktree add → omp worktree add]" : "[Command rewritten]";
+				const notice = `${label}\nRequested: ${trace.requestedCommand}\nExecuted: ${trace.executedCommand}\nIdentity: ${identity}`;
 				const firstText = content.findIndex(item => item.type === "text");
 				content = content.slice();
 				const item = content[firstText];
@@ -1126,7 +1154,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 
 		if (cfgWorktreeClone.get(this.session.settings)) {
-			command = rewriteGitWorktreeAdd(command, resolveCliEntryCmd());
+			const rewritten = rewriteGitWorktreeAdd(command, resolveCliEntryCmd());
+			if (rewritten !== command) trace.rewriteKind = "worktree-add";
+			command = rewritten;
 		}
 		trace.executedCommand = redactor.redactCommand(command);
 		trace.rewritten = command !== rawCommand;

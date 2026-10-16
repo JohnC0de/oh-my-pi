@@ -40,6 +40,44 @@ function makeSession(overrides: Readonly<Record<string, unknown>> = {}): ToolSes
 }
 
 describe("BashTool execution results", () => {
+	it("loads metadata secrets once for repeated commands in one directory", async () => {
+		const load = spyOn(StreamRedactor, "load").mockResolvedValue(new StreamRedactor([], []));
+		const tool = new BashTool(makeSession());
+		await tool.execute("first", { command: "true" });
+		await tool.execute("second", { command: "true" });
+		expect(load).toHaveBeenCalledTimes(1);
+	});
+
+	it.each([".omp/secrets.yml", ".env"])("refreshes metadata secrets when %s changes", async file => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "trace-refresh-"));
+		const session = makeSession();
+		session.cwd = cwd;
+		const tool = new BashTool(session);
+		const value = "newly-configured-synthetic-value";
+		try {
+			await tool.execute("before-secret", { command: "true" });
+			await Bun.write(
+				path.join(cwd, file),
+				file === ".env" ? `PUBLIC_LABEL=${value}\n` : `- type: plain\n  content: ${value}\n`,
+			);
+			const result = await tool.execute("after-secret", { command: `true ${value}` });
+			expect(result.details?.execution.requestedCommand).toBe("true ••••••");
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("retries metadata loading after a rejected load", async () => {
+		const load = spyOn(StreamRedactor, "load")
+			.mockRejectedValueOnce(new Error("transient metadata read failure"))
+			.mockResolvedValue(new StreamRedactor([], []));
+		const tool = new BashTool(makeSession());
+		await expect(tool.execute("failed", { command: "true" })).rejects.toThrow("transient metadata");
+		const result = await tool.execute("recovered", { command: "true" });
+		expect(result.details?.execution.requestedCommand).toBe("true");
+		expect(load).toHaveBeenCalledTimes(2);
+	});
+
 	it("retains managed job identity after a foreground job settles", async () => {
 		const session = makeSession({ "bash.autoBackground.enabled": true });
 		session.asyncJobManager = new AsyncJobManager({ retentionMs: 0 });
@@ -91,6 +129,9 @@ describe("BashTool execution results", () => {
 			rewritten: false,
 			ownerSessionId: "trace-session",
 			ownerAgentId: "trace-agent",
+			parentPid: process.pid,
+			parentExe: process.execPath,
+			jobUnavailableReason: expect.any(String),
 		});
 		expect(result.content.find(item => item.type === "text")?.text).not.toContain("[Command rewritten]");
 	});
@@ -111,7 +152,9 @@ describe("BashTool execution results", () => {
 		expect(result.details?.execution.requestedCommand).toContain("git worktree add");
 		expect(result.details?.execution.executedCommand).toContain("worktree add --");
 		const text = result.content.find(item => item.type === "text")?.text ?? "";
-		expect(text).toContain("[Command rewritten]");
+		expect(text).toContain("[git worktree add → omp worktree add]");
+		expect(text).toContain(`Executed: ${result.details?.execution.executedCommand}`);
+		expect(result.details?.execution.rewriteKind).toBe("worktree-add");
 		expect(text).toContain("rewritten-output");
 		expect(text).not.toContain("hidden-value");
 		expect(JSON.stringify(result.details?.execution)).not.toContain("hidden-value");

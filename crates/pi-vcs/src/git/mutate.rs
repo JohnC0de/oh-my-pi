@@ -27,6 +27,13 @@ use crate::{
 	},
 };
 
+struct ClonePolicy {
+	exclusions:   Vec<PathBuf>,
+	manifest:     pi_iso::CloneManifest,
+	files:        BTreeSet<PathBuf>,
+	traversal_ms: f64,
+}
+
 const INDEX_WRITE: gix::index::write::Options = gix::index::write::Options {
 	extensions: gix::index::write::Extensions::None,
 	skip_hash:  false,
@@ -627,6 +634,19 @@ impl GitRepo {
 				));
 			}
 		}
+		let preferred = match options.clone {
+			WorktreeClone::Off => None,
+			WorktreeClone::Auto => Some(None),
+			WorktreeClone::Prefer(kind) => Some(Some(kind)),
+		};
+		// Policy errors must not create or move a branch.
+		let policy_started = std::time::Instant::now();
+		let policy =
+			self.clone_exclusions(options.keep_changes, &options.include, preferred.is_some())?;
+		let policy_ms = policy_started.elapsed().as_secs_f64() * 1000.0;
+		let manifest = &policy.manifest;
+		let files = &policy.files;
+		let mut branch_ms = 0.0;
 		let head = if options.detach {
 			id.to_hex().to_string()
 		} else {
@@ -646,6 +666,7 @@ impl GitRepo {
 				.map_err(|e| Error::backend("git worktree add", e))?
 				.is_none()
 			{
+				let started = std::time::Instant::now();
 				update_reference(
 					&repo,
 					"git worktree add",
@@ -655,26 +676,30 @@ impl GitRepo {
 					"branch: Created from worktree add",
 					false,
 				)?;
+				branch_ms = started.elapsed().as_secs_f64() * 1000.0;
 			}
 			format!("ref: {full}")
 		};
 
-		let preferred = match options.clone {
-			WorktreeClone::Off => None,
-			WorktreeClone::Auto => Some(None),
-			WorktreeClone::Prefer(kind) => Some(Some(kind)),
-		};
 		let mut clone_error = None;
 		let mut clone_attempts = Vec::new();
 		if let Some(preferred) = preferred {
 			for kind in pi_iso::clone_candidates(preferred) {
 				let started = std::time::Instant::now();
-				let mut stats = pi_iso::CloneStats::default();
-				let result =
-					self.worktree_add_cloned(path, id, &head, kind, options.keep_changes, &mut stats);
+				let mut stats = pi_iso::CloneStats { policy_ms, branch_ms, ..Default::default() };
+				let result = self.worktree_add_cloned(
+					path,
+					id,
+					&head,
+					kind,
+					options.keep_changes,
+					&policy,
+					&mut stats,
+				);
 				let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
 				match result {
 					Ok(()) => {
+						let attempt_manifest = std::mem::take(&mut stats.manifest);
 						clone_attempts.push(WorktreeCloneAttempt {
 							backend: kind,
 							outcome: WorktreeCloneOutcome::Succeeded,
@@ -683,6 +708,7 @@ impl GitRepo {
 							elapsed_ms,
 							cleanup_ms: 0.0,
 						});
+						stats.manifest = attempt_manifest;
 						return Ok(WorktreeAddResult {
 							cloned_with: Some(kind),
 							clone_error,
@@ -691,6 +717,7 @@ impl GitRepo {
 						});
 					},
 					Err(err) => {
+						stats.manifest = pi_iso::CloneManifest::default();
 						let error = err.to_string();
 						clone_error = Some(error.clone());
 						let cleanup_started = std::time::Instant::now();
@@ -708,15 +735,55 @@ impl GitRepo {
 			}
 		}
 
+		let mut stats = pi_iso::CloneStats {
+			policy_ms,
+			branch_ms,
+			traversal_ms: policy.traversal_ms,
+			..Default::default()
+		};
 		let checkout = (|| -> Result<()> {
 			fs::create_dir_all(path)?;
+			let started = std::time::Instant::now();
 			let admin = register_worktree(path, &self.info().common_dir, &head)?;
+			stats.register_ms = started.elapsed().as_secs_f64() * 1000.0;
+			let started = std::time::Instant::now();
 			let linked = Self::require(path)?;
 			let linked_repo = linked.gix()?;
 			checkout_tree(&linked, &linked_repo, id, true)?;
+			stats.checkout_ms = started.elapsed().as_secs_f64() * 1000.0;
+			let started = std::time::Instant::now();
 			if options.keep_changes {
 				self.seed_worktree_changes(path, &admin, id)?;
 			}
+			stats.reconcile_ms = started.elapsed().as_secs_f64() * 1000.0;
+			let started = std::time::Instant::now();
+			let index = load_index_or_empty(&repo, "git worktree add")?;
+			let tracked: BTreeSet<PathBuf> = index
+				.entries()
+				.iter()
+				.map(|entry| worktree_path(entry.path(&index)).into_owned())
+				.collect();
+			// Required assets survive even when native cloning is disabled.
+			for relative in files {
+				if !tracked.contains(relative) {
+					let source = self.root().join(relative);
+					let target = path.join(relative);
+					if let Some(parent) = target.parent() {
+						fs::create_dir_all(parent)?;
+					}
+					if fs::symlink_metadata(&source)?.file_type().is_symlink() {
+						if !target.exists() {
+							copy_symlink(&source, &target)?;
+						}
+					} else {
+						fs::copy(source, target)?;
+					}
+				}
+			}
+			stats.copy_ms = started.elapsed().as_secs_f64() * 1000.0;
+			stats.manifest = manifest.clone();
+			stats.files_copied = stats.manifest.copied.iter().map(|entry| entry.files).sum();
+			stats.bytes_copied = stats.manifest.copied.iter().map(|entry| entry.bytes).sum();
 			Ok(())
 		})();
 		if let Err(source) = checkout {
@@ -727,7 +794,12 @@ impl GitRepo {
 				Error::WorktreeAdd { source: Box::new(source), clone_attempts }
 			});
 		}
-		Ok(WorktreeAddResult { cloned_with: None, clone_error, clone_stats: None, clone_attempts })
+		Ok(WorktreeAddResult {
+			cloned_with: None,
+			clone_error,
+			clone_stats: Some(stats),
+			clone_attempts,
+		})
 	}
 
 	/// Replicate the source checkout's uncommitted state onto a worktree at
@@ -811,7 +883,23 @@ impl GitRepo {
 		head: &str,
 		kind: pi_iso::BackendKind,
 		keep_changes: bool,
+		policy: &ClonePolicy,
 		stats: &mut pi_iso::CloneStats,
+	) -> Result<()> {
+		self.worktree_add_cloned_with_copy(path, id, head, keep_changes, policy, stats, |skip| {
+			pi_iso::backend(kind).clone_tree_with_stats(self.root(), path, skip)
+		})
+	}
+
+	fn worktree_add_cloned_with_copy(
+		&self,
+		path: &Path,
+		id: gix::hash::ObjectId,
+		head: &str,
+		keep_changes: bool,
+		policy: &ClonePolicy,
+		stats: &mut pi_iso::CloneStats,
+		copy: impl FnOnce(&[&OsStr]) -> std::result::Result<pi_iso::CloneStats, pi_iso::CloneError>,
 	) -> Result<()> {
 		let repo = self.gix()?;
 		for key in ["core.sparseCheckout", "core.splitIndex"] {
@@ -826,41 +914,49 @@ impl GitRepo {
 			return Err(Error::backend("git worktree add", "source index is missing"));
 		}
 
-		let policy_started = std::time::Instant::now();
-		let exclusions = self.clone_exclusions();
-		stats.policy_ms = policy_started.elapsed().as_secs_f64() * 1000.0;
-		let exclusions = exclusions?;
-		let skip: Vec<&OsStr> = exclusions.iter().map(|path| path.as_os_str()).collect();
+		let skip: Vec<&OsStr> = policy
+			.exclusions
+			.iter()
+			.map(|path| path.as_os_str())
+			.collect();
+		let manifest = &policy.manifest;
 		let policy_ms = stats.policy_ms;
-		match pi_iso::backend(kind).clone_tree_with_stats(self.root(), path, &skip) {
+		let branch_ms = stats.branch_ms;
+		match copy(&skip) {
 			Ok(measured) => *stats = measured,
 			Err(err) => {
-				*stats = err.stats;
+				*stats = *err.stats;
 				stats.policy_ms = policy_ms;
+				stats.branch_ms = branch_ms;
 				return Err(Error::backend("git worktree add", err.error));
 			},
 		}
 		stats.policy_ms = policy_ms;
+		stats.branch_ms = branch_ms;
+		stats.manifest = manifest.clone();
+		stats.traversal_ms += policy.traversal_ms;
+		if !stats.traversal_measured {
+			stats.copy_ms = stats.total_ms;
+			stats.files_copied = stats.manifest.copied.iter().map(|entry| entry.files).sum();
+			stats.bytes_copied = stats.manifest.copied.iter().map(|entry| entry.bytes).sum();
+		}
+		let started = std::time::Instant::now();
+		let admin = register_worktree(path, &self.info().common_dir, head)?;
+		fs::copy(&source_index, admin.join("index"))?;
+		stats.register_ms = started.elapsed().as_secs_f64() * 1000.0;
 		let reconcile_started = std::time::Instant::now();
-		let result =
-			self.reconcile_cloned_worktree(path, id, head, keep_changes, &repo, &source_index);
+		let (dirty_tracked, _) = collect_clone_reconciliation_paths(&repo)?;
+		let result = Self::reconcile_cloned_worktree(path, id, keep_changes, &dirty_tracked);
 		stats.reconcile_ms = reconcile_started.elapsed().as_secs_f64() * 1000.0;
 		result
 	}
 
 	fn reconcile_cloned_worktree(
-		&self,
 		path: &Path,
 		id: gix::hash::ObjectId,
-		head: &str,
 		keep_changes: bool,
-		repo: &gix::Repository,
-		source_index: &Path,
+		dirty_tracked: &BTreeSet<BString>,
 	) -> Result<()> {
-		let admin = register_worktree(path, &self.info().common_dir, head)?;
-		fs::copy(source_index, admin.join("index"))?;
-
-		let (dirty_tracked, untracked) = collect_clone_reconciliation_paths(repo)?;
 		let linked = Self::require(path)?;
 		let linked_repo = linked.gix()?;
 		let mut current = load_index_or_empty(&linked_repo, "git worktree add")?;
@@ -869,7 +965,7 @@ impl GitRepo {
 			// index carries its staged state. Only the stat cache is stale
 			// (new inodes); refresh it for entries the source reports clean so
 			// dirty files still hash on the next status.
-			refresh_clean_index_stats(&mut current, path, &dirty_tracked)?;
+			refresh_clean_index_stats(&mut current, path, dirty_tracked)?;
 			current
 				.write(INDEX_WRITE)
 				.map_err(|err| Error::backend("git worktree add", err))?;
@@ -885,7 +981,6 @@ impl GitRepo {
 			.into_iter()
 			.partition(|entry_path| target.entry_by_path(entry_path.as_bstr()).is_some());
 		let mut delete = removed;
-		delete.extend(untracked);
 		delete.extend(
 			dirty_tracked
 				.iter()
@@ -970,56 +1065,170 @@ impl GitRepo {
 		Ok(())
 	}
 
-	/// Clone exactly the live tracked and non-ignored untracked file set.
-	/// Ignore rules, not directory-name heuristics, express user intent: a
-	/// tracked `target/` or `node_modules/` remains present. Prune excluded
-	/// trees without descending into generated output or nested repositories.
-	fn clone_exclusions(&self) -> Result<Vec<PathBuf>> {
-		let mut files = BTreeSet::new();
-		let mut directories = BTreeSet::new();
+	/// Select tracked files, optional live untracked files, and explicitly
+	/// required assets. Prune every excluded directory before opening it.
+	fn clone_exclusions(
+		&self,
+		keep_changes: bool,
+		include: &[String],
+		clone_enabled: bool,
+	) -> Result<ClonePolicy> {
 		let repo = self.gix()?;
 		let index = load_index_or_empty(&repo, "git worktree add")?;
-		// All index stages own their live worktree path, including unresolved
-		// conflicts whose marker contents do not match any indexed blob.
-		let tracked = index
+		let mut files: BTreeSet<PathBuf> = index
 			.entries()
 			.iter()
-			.map(|entry| worktree_path(entry.path(&index)).into_owned());
-		let (_, untracked) = collect_clone_reconciliation_paths(&repo)?;
-		for path in tracked.chain(
-			untracked
-				.iter()
-				.map(|path| worktree_path(path.as_bstr()).into_owned()),
-		) {
-			let mut parent = path.parent();
-			while let Some(path) = parent {
-				directories.insert(path.to_path_buf());
-				parent = path.parent();
-			}
-			files.insert(path);
+			.map(|entry| worktree_path(entry.path(&index)).into_owned())
+			.collect();
+		let untracked = if keep_changes {
+			collect_clone_reconciliation_paths(&repo)?.1
+		} else {
+			BTreeSet::new()
+		};
+		if keep_changes {
+			files.extend(
+				untracked
+					.iter()
+					.map(|path| worktree_path(path.as_bstr()).into_owned()),
+			);
 		}
+		let mut builder = ignore::gitignore::GitignoreBuilder::new(self.root());
+		let mut include_roots = BTreeSet::new();
+		let include_file = self.root().join(".omp/worktree-include");
+		let contents = match fs::read_to_string(&include_file) {
+			Ok(contents) => contents,
+			Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+			Err(err) => return Err(err.into()),
+		};
+		for line in contents.lines().chain(include.iter().map(String::as_str)) {
+			builder
+				.add_line(None, line)
+				.map_err(|err| Error::backend("worktree include", err))?;
+			if let Some(root) = include_search_root(line) {
+				include_roots.insert(root);
+			}
+		}
+		let required = builder
+			.build()
+			.map_err(|err| Error::backend("worktree include", err))?;
+		let mut manifest = pi_iso::CloneManifest::default();
 		let mut excluded = vec![PathBuf::from(".git")];
+		manifest.excluded.push(pi_iso::ClonePath {
+			path: ".git".into(),
+			counts_measured: false,
+			..Default::default()
+		});
+		if !clone_enabled && include_roots.is_empty() {
+			// A checkout needs no exclusion walk; stat only the selected payload.
+			for path in &files {
+				if let Ok(meta) = fs::symlink_metadata(self.root().join(path))
+					&& !meta.is_dir()
+				{
+					manifest.copied.push(clone_manifest_entry(path, &meta));
+				}
+			}
+			return Ok(ClonePolicy { exclusions: excluded, manifest, files, traversal_ms: 0.0 });
+		}
+		let directories: BTreeSet<PathBuf> = files
+			.iter()
+			.flat_map(|path| path.ancestors().skip(1).map(Path::to_path_buf))
+			.collect();
+		let traversal_started = std::time::Instant::now();
 		let mut pending = vec![PathBuf::new()];
+		let mut visited = std::collections::HashSet::new();
 		while let Some(relative) = pending.pop() {
-			for entry in fs::read_dir(self.root().join(&relative))? {
+			let full = self.root().join(&relative);
+			#[cfg(unix)]
+			let identity = {
+				use std::os::unix::fs::MetadataExt;
+				let metadata = fs::metadata(&full)?;
+				(metadata.dev(), metadata.ino())
+			};
+			#[cfg(not(unix))]
+			let identity = same_file::Handle::from_path(&full)?;
+			if !visited.insert(identity) {
+				continue;
+			}
+			let entries = match fs::read_dir(&full) {
+				Ok(entries) => entries,
+				Err(err)
+					if err.kind() == std::io::ErrorKind::PermissionDenied
+						&& !directories.contains(&relative) =>
+				{
+					excluded.push(relative.clone());
+					manifest.excluded.push(pi_iso::ClonePath {
+						path: relative.to_string_lossy().into_owned(),
+						counts_measured: false,
+						..Default::default()
+					});
+					continue;
+				},
+				Err(err) => return Err(err.into()),
+			};
+			for entry in entries {
 				let entry = entry?;
 				let child = relative.join(entry.file_name());
-				if child == Path::new(".git") {
+				if entry.file_name() == ".git" {
 					continue;
 				}
 				let kind = entry.file_type()?;
+				let include_match = required.matched_path_or_any_parents(&child, kind.is_dir());
 				if kind.is_dir() {
-					if directories.contains(&child) {
-						pending.push(child);
+					files.remove(&child);
+					let needed = directories.contains(&child)
+						|| include_roots
+							.range((std::ops::Bound::Excluded(child.clone()), std::ops::Bound::Unbounded))
+							.next()
+							.is_some_and(|root| root.starts_with(&child))
+						|| (!include_match.is_whitelist()
+							&& (include_match.is_ignore()
+								|| child
+									.ancestors()
+									.any(|parent| include_roots.contains(parent))));
+					if !needed || entry.path().join(".git").exists() {
+						excluded.push(child.clone());
+						manifest.excluded.push(pi_iso::ClonePath {
+							path: child.to_string_lossy().into_owned(),
+							counts_measured: false,
+							..Default::default()
+						});
 					} else {
-						excluded.push(child);
+						pending.push(child);
 					}
-				} else if !files.contains(&child) {
+					continue;
+				}
+				if include_match.is_ignore() {
+					files.insert(child.clone());
+				}
+				let selected = files.contains(&child);
+				let metadata = match if kind.is_symlink() {
+					fs::symlink_metadata(entry.path())
+				} else {
+					entry.metadata()
+				} {
+					Ok(metadata) => metadata,
+					Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+					Err(err) => return Err(err.into()),
+				};
+				let item = clone_manifest_entry(&child, &metadata);
+				if selected {
+					manifest.copied.push(item);
+				} else {
 					excluded.push(child);
+					manifest.excluded.push(item);
 				}
 			}
 		}
-		Ok(excluded)
+		manifest.copied.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+		manifest
+			.excluded
+			.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+		Ok(ClonePolicy {
+			exclusions: excluded,
+			manifest,
+			files,
+			traversal_ms: traversal_started.elapsed().as_secs_f64() * 1000.0,
+		})
 	}
 
 	/// Resolve the executable hook `name` as git's `find_hook` does: under
@@ -1071,6 +1280,42 @@ impl GitRepo {
 		}
 		Ok(())
 	}
+}
+
+fn clone_manifest_entry(path: &Path, metadata: &fs::Metadata) -> pi_iso::ClonePath {
+	pi_iso::ClonePath {
+		path:            path.to_string_lossy().into_owned(),
+		files:           u64::from(metadata.is_file()),
+		bytes:           if metadata.is_file() {
+			metadata.len()
+		} else {
+			0
+		},
+		counts_measured: true,
+	}
+}
+
+/// A conservative search prefix: unanchored names and wildcard-leading
+/// patterns may match anywhere, while literal parents bound the walk.
+fn include_search_root(line: &str) -> Option<PathBuf> {
+	let line = line.trim_end();
+	if line.is_empty() || line.starts_with(['#', '!']) {
+		return None;
+	}
+	let pattern = line.strip_prefix('/').unwrap_or(line);
+	if !line.starts_with('/') && !pattern.trim_end_matches('/').contains('/') {
+		return Some(PathBuf::new());
+	}
+	let mut root = PathBuf::new();
+	for component in pattern.split('/') {
+		if component.contains(['*', '?', '[', '\\']) {
+			break;
+		}
+		if !component.is_empty() {
+			root.push(component);
+		}
+	}
+	Some(root)
 }
 
 fn run_commit_hook(repository: &GitRepo, name: &str, args: &[&OsStr]) -> Result<()> {
@@ -1968,7 +2213,7 @@ fn register_worktree(path: &Path, common: &Path, head: &str) -> Result<PathBuf> 
 		let candidate = worktrees.join(worktree_admin_name(common, path));
 		match fs::create_dir(&candidate) {
 			Ok(()) => break candidate,
-			Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+			Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {},
 			Err(err) => return Err(err.into()),
 		}
 	};
@@ -2724,6 +2969,7 @@ mod tests {
 				detach:       true,
 				clone:        WorktreeClone::Off,
 				keep_changes: false,
+				include:      Vec::new(),
 			})
 			.unwrap();
 		assert_eq!(fs::read_to_string(linked.join("a")).unwrap(), "main\r\n");
@@ -2974,6 +3220,7 @@ mod tests {
 				detach:       true,
 				clone:        WorktreeClone::Off,
 				keep_changes: false,
+				include:      Vec::new(),
 			})
 			.unwrap();
 		let common = fs::canonicalize(repo.info().common_dir.clone()).unwrap();
@@ -3027,6 +3274,7 @@ mod tests {
 				detach:       true,
 				clone:        WorktreeClone::Off,
 				keep_changes: false,
+				include:      Vec::new(),
 			})
 			.unwrap();
 
@@ -3071,6 +3319,7 @@ mod tests {
 				detach:       false,
 				clone:        WorktreeClone::Auto,
 				keep_changes: false,
+				include:      Vec::new(),
 			})
 			.unwrap();
 
@@ -3124,6 +3373,7 @@ mod tests {
 					detach:       false,
 					clone:        WorktreeClone::Auto,
 					keep_changes: false,
+					include:      Vec::new(),
 				})
 				.unwrap_err();
 			assert!(error.to_string().contains("overlap"));
@@ -3132,6 +3382,215 @@ mod tests {
 			assert!(!temp.path().join("new").exists());
 			assert!(!temp.path().join("missing").exists());
 		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn excluded_unreadable_directories_are_pruned_without_measurement() {
+		use std::os::unix::fs::PermissionsExt;
+		for clone in [WorktreeClone::Auto, WorktreeClone::Off] {
+			let (temp, repo) = fixture();
+			fs::write(temp.path().join(".gitignore"), "private/\n").unwrap();
+			git(temp.path(), &["add", ".gitignore"]);
+			git(temp.path(), &["commit", "-qm", "ignore private"]);
+			let private = temp.path().join("private");
+			fs::create_dir(&private).unwrap();
+			fs::write(private.join("payload"), b"must not be inspected").unwrap();
+			fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
+			let destination = tempfile::tempdir().unwrap();
+			let linked = destination.path().join("linked");
+			let outcome = repo.worktree_add(&linked, "HEAD", WorktreeAddOptions {
+				detach: true,
+				clone,
+				keep_changes: false,
+				include: Vec::new(),
+			});
+			fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+			let result = outcome.unwrap();
+			let stats = result.clone_stats.unwrap();
+			if clone == WorktreeClone::Auto {
+				let excluded = stats
+					.manifest
+					.excluded
+					.iter()
+					.find(|entry| entry.path == "private")
+					.unwrap();
+				assert!(!excluded.counts_measured);
+				assert_eq!((excluded.files, excluded.bytes), (0, 0));
+				assert!(
+					!stats
+						.manifest
+						.excluded
+						.iter()
+						.any(|entry| entry.path == "private/payload")
+				);
+			} else {
+				assert_eq!(stats.traversal_ms, 0.0);
+			}
+			assert!(!linked.join("private").exists());
+			assert_eq!(git(&linked, &["status", "--porcelain"]), "");
+			repo.worktree_remove(&linked, true).unwrap();
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn unreadable_untracked_directory_does_not_abort_non_keep_add() {
+		use std::os::unix::fs::PermissionsExt;
+		for clone in [WorktreeClone::Auto, WorktreeClone::Off] {
+			let (temp, repo) = fixture();
+			let scratch = temp.path().join("scratch");
+			fs::create_dir(&scratch).unwrap();
+			fs::write(scratch.join("payload"), b"untracked").unwrap();
+			fs::set_permissions(&scratch, fs::Permissions::from_mode(0o000)).unwrap();
+			let destination = tempfile::tempdir().unwrap();
+			let linked = destination.path().join("linked");
+			let outcome = repo.worktree_add(&linked, "HEAD", WorktreeAddOptions {
+				detach: true,
+				clone,
+				keep_changes: false,
+				include: Vec::new(),
+			});
+			fs::set_permissions(&scratch, fs::Permissions::from_mode(0o700)).unwrap();
+			outcome.unwrap();
+			assert!(!linked.join("scratch").exists());
+			assert_eq!(git(&linked, &["status", "--porcelain"]), "");
+			repo.worktree_remove(&linked, true).unwrap();
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn worktree_add_under_search_only_parent_succeeds() {
+		use std::os::unix::fs::PermissionsExt;
+		let (_temp, repo) = fixture();
+		let destination = tempfile::tempdir().unwrap();
+		let parent = destination.path().join("parent");
+		fs::create_dir(&parent).unwrap();
+		fs::set_permissions(&parent, fs::Permissions::from_mode(0o311)).unwrap();
+		let linked = parent.join("linked");
+		let outcome = repo.worktree_add(&linked, "HEAD", WorktreeAddOptions {
+			detach:       true,
+			clone:        WorktreeClone::Auto,
+			keep_changes: false,
+			include:      Vec::new(),
+		});
+		fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+		outcome.unwrap();
+		assert_eq!(fs::read(linked.join("a")).unwrap(), b"one\n");
+		repo.worktree_remove(&linked, true).unwrap();
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn include_discovery_excludes_unreadable_ignored_directory() {
+		use std::os::unix::fs::PermissionsExt;
+		let (temp, repo) = fixture();
+		fs::write(temp.path().join(".gitignore"), "private/\n*.so\n").unwrap();
+		git(temp.path(), &["add", ".gitignore"]);
+		git(temp.path(), &["commit", "-qm", "ignore assets"]);
+		let private = temp.path().join("private");
+		fs::create_dir(&private).unwrap();
+		fs::write(private.join("hidden.so"), b"unreadable").unwrap();
+		fs::write(temp.path().join("required.so"), b"required").unwrap();
+		fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
+		// Root can read mode-000 directories, so it cannot exercise this case.
+		let denied = fs::read_dir(&private).is_err();
+		let destination = tempfile::tempdir().unwrap();
+		let linked = destination.path().join("linked");
+		let outcome = repo.worktree_add(&linked, "HEAD", WorktreeAddOptions {
+			detach:       true,
+			clone:        WorktreeClone::Auto,
+			keep_changes: false,
+			include:      vec!["*.so".into()],
+		});
+		fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+		let result = outcome.unwrap();
+		if denied {
+			let stats = result.clone_stats.unwrap();
+			let excluded = stats
+				.manifest
+				.excluded
+				.iter()
+				.find(|entry| entry.path == "private")
+				.unwrap();
+			assert!(!excluded.counts_measured);
+			assert!(!linked.join("private").exists());
+		}
+		assert_eq!(fs::read(linked.join("required.so")).unwrap(), b"required");
+		repo.worktree_remove(&linked, true).unwrap();
+	}
+
+	#[test]
+	fn source_edits_during_copy_are_reconciled_in_both_retention_modes() {
+		for keep_changes in [false, true] {
+			let (temp, repo) = fixture();
+			let policy = repo.clone_exclusions(keep_changes, &[], true).unwrap();
+			let destination = tempfile::tempdir().unwrap();
+			let linked = destination.path().join("linked");
+			let id = repo.gix().unwrap().head_id().unwrap().detach();
+			let mut stats = pi_iso::CloneStats::default();
+			repo
+				.worktree_add_cloned_with_copy(
+					&linked,
+					id,
+					&id.to_hex().to_string(),
+					keep_changes,
+					&policy,
+					&mut stats,
+					|_| {
+						// Change the source after policy status, before its bytes are
+						// copied.
+						fs::write(temp.path().join("a"), b"edited during copy\n").unwrap();
+						fs::create_dir(&linked).unwrap();
+						for relative in &policy.files {
+							fs::copy(temp.path().join(relative), linked.join(relative)).unwrap();
+						}
+						Ok(pi_iso::CloneStats { traversal_measured: true, ..Default::default() })
+					},
+				)
+				.unwrap();
+			assert_eq!(
+				fs::read(linked.join("a")).unwrap(),
+				if keep_changes {
+					b"edited during copy\n".as_slice()
+				} else {
+					b"one\n".as_slice()
+				}
+			);
+			assert_eq!(
+				git(&linked, &["status", "--porcelain"]),
+				if keep_changes { " M a" } else { "" }
+			);
+			repo.worktree_remove(&linked, true).unwrap();
+		}
+	}
+
+	#[test]
+	fn checkout_retention_refreshes_dirty_and_untracked_paths_after_policy() {
+		let (temp, repo) = fixture();
+		let _policy = repo.clone_exclusions(true, &[], false).unwrap();
+		let destination = tempfile::tempdir().unwrap();
+		let linked = destination.path().join("linked");
+		repo
+			.worktree_add(&linked, "HEAD", WorktreeAddOptions {
+				detach:       true,
+				clone:        WorktreeClone::Off,
+				keep_changes: false,
+				include:      Vec::new(),
+			})
+			.unwrap();
+		fs::write(temp.path().join("a"), b"edited after checkout\n").unwrap();
+		fs::write(temp.path().join("new"), b"new untracked\n").unwrap();
+		let linked_repo = GitRepo::require(&linked).unwrap();
+		let id = repo.gix().unwrap().head_id().unwrap().detach();
+		repo
+			.seed_worktree_changes(&linked, &linked_repo.info().git_dir, id)
+			.unwrap();
+		assert_eq!(fs::read(linked.join("a")).unwrap(), b"edited after checkout\n");
+		assert_eq!(fs::read(linked.join("new")).unwrap(), b"new untracked\n");
+		assert_eq!(git(&linked, &["status", "--porcelain"]), " M a\n?? new");
+		repo.worktree_remove(&linked, true).unwrap();
 	}
 
 	#[test]
@@ -3145,11 +3604,89 @@ mod tests {
 					detach:       true,
 					clone:        WorktreeClone::Auto,
 					keep_changes: false,
+					include:      Vec::new(),
 				})
 				.is_err()
 		);
 		assert_eq!(fs::read_to_string(destination.path().join("user-data")).unwrap(), "precious\n");
 		assert!(temp.path().join(".git").is_dir());
+	}
+
+	#[test]
+	fn required_ignored_assets_and_manifest_match_both_retention_modes() {
+		for (clone, keep_changes) in [
+			(WorktreeClone::Auto, false),
+			(WorktreeClone::Auto, true),
+			(WorktreeClone::Off, false),
+			(WorktreeClone::Off, true),
+		] {
+			let (temp, repo) = fixture();
+			fs::create_dir_all(temp.path().join(".omp")).unwrap();
+			fs::create_dir_all(temp.path().join("assets")).unwrap();
+			fs::write(temp.path().join(".gitignore"), "assets/\n").unwrap();
+			fs::write(
+				temp.path().join(".omp/worktree-include"),
+				"# Required directory, with selective \
+				 exclusions\n/assets/\n!/assets/settings.bin\n!/assets/excluded.bin\n",
+			)
+			.unwrap();
+			git(temp.path(), &["add", ".gitignore", ".omp/worktree-include"]);
+			git(temp.path(), &["commit", "-qm", "asset policy"]);
+			fs::write(temp.path().join("assets/repo.bin"), b"repo").unwrap();
+			fs::write(temp.path().join("assets/settings.bin"), b"setting").unwrap();
+			fs::write(temp.path().join("assets/excluded.bin"), b"excluded").unwrap();
+			fs::write(temp.path().join("untracked"), b"not copied").unwrap();
+			let destination = tempfile::tempdir().unwrap();
+			let linked = destination.path().join("linked");
+			let result = repo
+				.worktree_add(&linked, "HEAD", WorktreeAddOptions {
+					detach: true,
+					clone,
+					keep_changes,
+					include: vec!["/assets/settings.bin".into()],
+				})
+				.unwrap();
+			assert_eq!(fs::read(linked.join("assets/repo.bin")).unwrap(), b"repo");
+			assert_eq!(fs::read(linked.join("assets/settings.bin")).unwrap(), b"setting");
+			assert!(!linked.join("assets/excluded.bin").exists());
+			assert_eq!(linked.join("untracked").exists(), keep_changes);
+			let stats = result.clone_stats.unwrap();
+			assert_eq!(
+				stats
+					.manifest
+					.copied
+					.iter()
+					.any(|entry| entry.path == "untracked"),
+				keep_changes
+			);
+			assert_eq!(
+				stats
+					.manifest
+					.excluded
+					.iter()
+					.any(|entry| entry.path == "untracked" && entry.files == 1 && entry.bytes == 10),
+				!keep_changes
+			);
+			assert!(
+				stats
+					.manifest
+					.copied
+					.iter()
+					.any(|entry| entry.path == "assets/repo.bin" && entry.bytes == 4)
+			);
+			if result.cloned_with.is_some() {
+				assert_eq!(
+					stats.files_copied,
+					stats.manifest.copied.iter().map(|entry| entry.files).sum()
+				);
+				assert_eq!(
+					stats.bytes_copied,
+					stats.manifest.copied.iter().map(|entry| entry.bytes).sum()
+				);
+			}
+			assert!(stats.register_ms >= 0.0 && stats.reconcile_ms >= 0.0);
+			repo.worktree_remove(&linked, true).unwrap();
+		}
 	}
 
 	#[test]
@@ -3166,7 +3703,7 @@ mod tests {
 		fs::write(temp.path().join("nested/cache/bulky"), "ignored\n").unwrap();
 		fs::write(temp.path().join("nested/notes"), "untracked\n").unwrap();
 		git(temp.path(), &["worktree", "add", "--detach", "nested/linked", "HEAD"]);
-		let excluded = repo.clone_exclusions().unwrap();
+		let excluded = repo.clone_exclusions(true, &[], true).unwrap().exclusions;
 		assert!(excluded.contains(&PathBuf::from("target/bulky")));
 		assert!(excluded.contains(&PathBuf::from("nested/cache")));
 		assert!(excluded.contains(&PathBuf::from("nested/linked")));
@@ -3179,6 +3716,7 @@ mod tests {
 				detach:       true,
 				clone:        WorktreeClone::Auto,
 				keep_changes: true,
+				include:      Vec::new(),
 			})
 			.unwrap();
 		if clone_works {
@@ -3228,10 +3766,11 @@ mod tests {
 				detach:       true,
 				clone:        WorktreeClone::Auto,
 				keep_changes: false,
+				include:      Vec::new(),
 			})
 			.unwrap();
 		assert!(result.cloned_with.is_none());
-		assert!(result.clone_stats.is_none());
+		assert!(result.clone_stats.is_some());
 		assert_eq!(result.clone_attempts.len(), candidates.len());
 		for (attempt, backend) in result.clone_attempts.iter().zip(candidates) {
 			assert_eq!(attempt.backend, backend);
@@ -3249,10 +3788,11 @@ mod tests {
 	}
 
 	#[test]
-	fn terminal_checkout_error_retains_failed_clone_attempts() {
+	fn policy_failure_precedes_clone_attempts_and_preserves_source() {
 		let (temp, repo) = fixture();
 		git(temp.path(), &["config", "core.splitIndex", "true"]);
-		// Leave the commit resolvable, but make checkout of its tree fail.
+		// Keep-mode policy status requires the tree, before cloning or
+		// registration.
 		let tree = git(temp.path(), &["rev-parse", "HEAD^{tree}"]);
 		let tree_path = repo
 			.info()
@@ -3262,45 +3802,32 @@ mod tests {
 			.join(&tree[2..]);
 		let tree_bytes = fs::read(&tree_path).unwrap();
 		let listed_before = git(temp.path(), &["worktree", "list", "--porcelain"]);
+		let refs_before = git(temp.path(), &["show-ref"]);
 		fs::remove_file(&tree_path).unwrap();
 		let destination = tempfile::tempdir().unwrap();
 		let linked = destination.path().join("linked");
-		let candidates = pi_iso::clone_candidates(None);
 		let error = repo
 			.worktree_add(&linked, "HEAD", WorktreeAddOptions {
-				detach:       true,
+				detach:       false,
 				clone:        WorktreeClone::Auto,
-				keep_changes: false,
+				keep_changes: true,
+				include:      Vec::new(),
 			})
 			.unwrap_err();
-		let kind = error.kind();
-		let message = error.to_string();
-		match error {
-			Error::WorktreeAdd { source, clone_attempts } => {
-				assert_eq!(kind, source.kind());
-				assert_eq!(message, source.to_string());
-				assert_eq!(clone_attempts.len(), candidates.len());
-				assert!(!clone_attempts.is_empty());
-				for attempt in clone_attempts {
-					assert_eq!(attempt.outcome, WorktreeCloneOutcome::Failed);
-					assert!(attempt.error.as_ref().unwrap().contains("core.splitIndex"));
-					assert!(!attempt.stats.traversal_measured);
-					assert!(attempt.elapsed_ms.is_finite() && attempt.elapsed_ms >= 0.0);
-					assert!(attempt.cleanup_ms.is_finite() && attempt.cleanup_ms >= 0.0);
-				}
-			},
-			_ => assert!(candidates.is_empty(), "lost clone attempts: {message}"),
-		}
+		assert!(error.to_string().contains("could not be found"), "{error}");
+		assert!(!matches!(error, Error::WorktreeAdd { .. }), "no backend was attempted");
 		assert_eq!(fs::read(temp.path().join("a")).unwrap(), b"one\n");
 		assert!(!linked.exists(), "terminal failure must remove the newly created destination");
 		assert!(!repo.info().common_dir.join("worktrees/linked").exists());
 		assert_eq!(git(temp.path(), &["worktree", "list", "--porcelain"]), listed_before);
+		assert_eq!(git(temp.path(), &["show-ref"]), refs_before);
 		fs::write(&tree_path, tree_bytes).unwrap();
 		repo
 			.worktree_add(&linked, "HEAD", WorktreeAddOptions {
 				detach:       true,
 				clone:        WorktreeClone::Auto,
 				keep_changes: false,
+				include:      Vec::new(),
 			})
 			.unwrap();
 		assert_eq!(fs::read(linked.join("a")).unwrap(), b"one\n");
@@ -3330,6 +3857,7 @@ mod tests {
 					detach:       true,
 					clone:        WorktreeClone::Off,
 					keep_changes: false,
+					include:      Vec::new(),
 				},)
 				.is_err()
 		);
@@ -3347,12 +3875,8 @@ mod tests {
 				0o750
 			);
 		}
-		assert!(
-			fs::read_dir(repo.info().common_dir.join("worktrees"))
-				.unwrap()
-				.next()
-				.is_none()
-		);
+		let admin = repo.info().common_dir.join("worktrees");
+		assert!(!admin.exists() || fs::read_dir(admin).unwrap().next().is_none());
 	}
 
 	#[cfg(unix)]
@@ -3377,7 +3901,7 @@ mod tests {
 			fs::write(temp.path().join(&untracked), b"untracked").unwrap();
 			fs::create_dir(temp.path().join(ignored)).unwrap();
 			fs::write(temp.path().join(ignored).join("output"), b"ignored").unwrap();
-			let exclusions = repo.clone_exclusions().unwrap();
+			let exclusions = repo.clone_exclusions(true, &[], true).unwrap().exclusions;
 			assert!(!exclusions.contains(&tracked.to_path_buf()));
 			assert!(!exclusions.contains(&directory.to_path_buf()));
 			assert!(!exclusions.contains(&nested));
@@ -3391,6 +3915,7 @@ mod tests {
 					detach: true,
 					clone,
 					keep_changes: true,
+					include: Vec::new(),
 				})
 				.unwrap();
 			if native_available {
@@ -3452,7 +3977,7 @@ mod tests {
 				3
 			);
 			let index_before = fs::read(repo.info().git_dir.join("index")).unwrap();
-			let exclusions = repo.clone_exclusions().unwrap();
+			let exclusions = repo.clone_exclusions(true, &[], true).unwrap().exclusions;
 			assert!(!exclusions.contains(&PathBuf::from("a")));
 			assert!(exclusions.contains(&PathBuf::from("build")));
 			let destination = tempfile::tempdir().unwrap();
@@ -3463,6 +3988,7 @@ mod tests {
 					detach: true,
 					clone,
 					keep_changes: true,
+					include: Vec::new(),
 				})
 				.unwrap();
 			if clone_works {
@@ -3470,7 +3996,9 @@ mod tests {
 				let attempt = result.clone_attempts.last().unwrap();
 				assert_eq!(attempt.outcome, WorktreeCloneOutcome::Succeeded);
 				assert_eq!(Some(attempt.backend), result.cloned_with);
-				assert_eq!(Some(&attempt.stats), result.clone_stats.as_ref());
+				let mut expected = result.clone_stats.clone().unwrap();
+				expected.manifest = pi_iso::CloneManifest::default();
+				assert_eq!(attempt.stats, expected);
 			}
 			assert_eq!(fs::read(linked.join("a")).unwrap(), conflict);
 			assert_eq!(git(&linked, &["ls-files", "--stage"]), stages);
@@ -3493,6 +4021,7 @@ mod tests {
 				detach:       false,
 				clone:        WorktreeClone::Auto,
 				keep_changes: false,
+				include:      Vec::new(),
 			})
 			.unwrap();
 		if clone_works {
@@ -3536,6 +4065,7 @@ mod tests {
 					detach: false,
 					clone,
 					keep_changes: true,
+					include: Vec::new(),
 				})
 				.unwrap();
 			if clone == WorktreeClone::Off {
@@ -3559,7 +4089,7 @@ mod tests {
 			let rejected = repo.worktree_add(
 				&temp.path().join("../linked-keep-rejected"),
 				"HEAD~1",
-				WorktreeAddOptions { detach: true, clone, keep_changes: true },
+				WorktreeAddOptions { detach: true, clone, keep_changes: true, include: Vec::new() },
 			);
 			assert!(rejected.is_err(), "keep_changes must require the source HEAD as target");
 			let _ = repo.worktree_remove(&linked, true);
@@ -3592,6 +4122,7 @@ mod tests {
 					detach: false,
 					clone,
 					keep_changes: true,
+					include: Vec::new(),
 				})
 				.unwrap();
 			if clone == WorktreeClone::Off {
@@ -3620,6 +4151,7 @@ mod tests {
 				detach:       true,
 				clone:        WorktreeClone::Off,
 				keep_changes: false,
+				include:      Vec::new(),
 			})
 			.unwrap();
 		assert!(
@@ -3635,6 +4167,7 @@ mod tests {
 				detach:       true,
 				clone:        WorktreeClone::Off,
 				keep_changes: false,
+				include:      Vec::new(),
 			})
 			.unwrap();
 		let common = fs::canonicalize(repo.info().common_dir.clone()).unwrap();
