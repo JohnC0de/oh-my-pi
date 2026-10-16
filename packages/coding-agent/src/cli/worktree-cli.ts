@@ -25,6 +25,7 @@ import chalk from "@oh-my-pi/pi-utils/chalk";
 import { Settings } from "../config/settings";
 import { hasLiveIsolationOwner, ISOLATION_OWNER_FILE, readRetainedMountBackend } from "../task/isolation-ownership";
 import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
+import { resolveSyscallTarget } from "../tools/path-utils";
 
 import { cfgIsolationBackend, cfgWorktreeClone } from "../task/settings";
 
@@ -96,6 +97,24 @@ export async function stopRetainedMount(dir: string): Promise<boolean> {
 	return false;
 }
 
+/** Native phase timings are disjoint; bulk-clone backends do not enumerate entries. */
+export function formatWorktreeCloneStats(stats: {
+	totalMs: number;
+	policyMs: number;
+	reconcileMs: number;
+	traversalMeasured: boolean;
+	entriesVisited: number;
+	directoriesCreated: number;
+	filesCopied: number;
+	bytesCopied: number;
+	symlinksCopied: number;
+	entriesSkipped: number;
+}): string {
+	const timings = `Clone timing: policy=${stats.policyMs.toFixed(2)}ms clone=${stats.totalMs.toFixed(2)}ms reconcile=${stats.reconcileMs.toFixed(2)}ms`;
+	if (!stats.traversalMeasured) return `${timings}; traversal counters unavailable for bulk backend`;
+	return `${timings}; visited=${stats.entriesVisited} directories=${stats.directoriesCreated} files=${stats.filesCopied} bytes=${stats.bytesCopied} symlinks=${stats.symlinksCopied} skipped=${stats.entriesSkipped}`;
+}
+
 export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	if (options.branch && options.forceBranch) {
 		throw new Error("fatal: options '-b' and '-B' cannot be used together");
@@ -103,6 +122,20 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	const cwd = path.resolve(options.cwd ?? process.cwd());
 	const repository = vcs.requireGit(cwd);
 	const worktreePath = path.resolve(cwd, options.path);
+	const source = await resolveSyscallTarget(repository.info().repoRoot, true);
+	const destination = await resolveSyscallTarget(worktreePath, true);
+	if (source === null || destination === null) {
+		throw new Error("fatal: cannot resolve worktree source or destination");
+	}
+	const contains = (parent: string, child: string): boolean => {
+		const relative = path.relative(parent, child);
+		return (
+			relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+		);
+	};
+	if (contains(source, destination) || contains(destination, source)) {
+		throw new Error("fatal: source and destination trees overlap");
+	}
 	try {
 		const stat = await fs.stat(worktreePath);
 		const nonEmpty = !stat.isDirectory() || (await fs.readdir(worktreePath)).length > 0;
@@ -156,6 +189,11 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 		console.log(`HEAD is now at ${shortSha} ${subject}`);
 		if (result.clonedWith != null) {
 			console.log(`Cloned from ${repository.info().repoRoot} via ${formatIsolationBackend(result.clonedWith)}`);
+		}
+		for (const attempt of result.cloneAttempts) {
+			console.log(
+				`Clone attempt (${formatIsolationBackend(attempt.backend)}, ${attempt.outcome}): elapsed=${attempt.elapsedMs.toFixed(2)}ms cleanup=${attempt.cleanupMs.toFixed(2)}ms; ${formatWorktreeCloneStats(attempt.stats)}`,
+			);
 		}
 	}
 	if (result.cloneError) {

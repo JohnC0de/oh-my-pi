@@ -126,12 +126,16 @@ mod imp {
 
 	pub fn start(lower: &Path, merged: &Path) -> IsoResult<()> {
 		let lower = tree::canonical_existing_dir(lower, "overlay lower", IsoError::other)?;
+		tree::validate_destination(&lower, merged)?;
 		let merged = std::path::absolute(merged).unwrap_or_else(|_| merged.to_path_buf());
 		let base = merged.parent().ok_or_else(|| {
 			IsoError::other(format!("merged path has no parent: {}", merged.display()))
 		})?;
 		let upper = base.join("upper");
 		let work = base.join("work");
+		// All three directories are cleared below; none may contain the source.
+		tree::validate_destination(&lower, &upper)?;
+		tree::validate_destination(&lower, &work)?;
 
 		remove_dir_if_exists(&upper, "stale overlay upper")?;
 		remove_dir_if_exists(&work, "stale overlay work")?;

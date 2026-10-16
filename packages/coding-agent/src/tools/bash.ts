@@ -20,7 +20,7 @@ import { isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
 import { isPosixShell } from "@oh-my-pi/pi-utils/procmgr";
 import { raceJobSettlement, resolveAutoBackgroundWaitMs } from "../async";
 import type { Settings } from "../config/settings";
-import { applyDirenvPreflight, type BashResult, executeBash } from "../exec/bash-executor";
+import { applyDirenvPreflight, type BashDispatch, type BashResult, executeBash } from "../exec/bash-executor";
 import { InternalUrlRouter } from "../internal-urls";
 import { sessionResolveContext } from "../internal-urls/context";
 import { InternalUrlFilesystem, UrlFsError } from "../internal-urls/url-filesystem";
@@ -33,15 +33,16 @@ import type {
 import { DEFAULT_MAX_BYTES, enforceInlineByteCap } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { resolveCliEntryCmd } from "../subprocess/worker-client";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
+import { StreamRedactor } from "../stream/redactor";
 import type { ToolSession } from ".";
-import { type ApprovalDetailsOptions, truncateApprovalDetail } from "./approval";
+import { truncateForPrompt } from "./approval";
 import { type BashInteractiveResult, runInteractiveBashPty } from "./bash-interactive";
 import { checkBashInterception } from "./bash-interceptor";
 import { rewriteGitWorktreeAdd } from "./bash-worktree-rewrite";
 import { canUseInteractiveBashPty } from "./bash-pty-selection";
 import { resolveEvalBackends } from "./eval-backends";
 import { invalidateGithubCacheForBashCommand } from "./gh-cache-invalidation";
-import { startService, type ServiceReady } from "../launch/services";
+import { serviceLogs, startService, type ServiceReady } from "../launch/services";
 import { isFindEnabled } from "./jfind";
 import { formatArtifactErrorNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
@@ -415,6 +416,29 @@ function normalizeReady(ready: ServiceReady | undefined): ServiceReady | undefin
 
 export interface BashToolOptions {}
 
+export interface BashExecutionTrace {
+	requestedCommand: string;
+	executedCommand: string;
+	rewritten: boolean;
+	ownerSessionId?: string;
+	ownerAgentId?: string;
+	pids?: readonly number[];
+	jobId?: string;
+	/** Redacted exact backend input, not a prediction made before launch. */
+	dispatch?: BashDispatch;
+	dispatchUnavailableReason?: string;
+	pidStatus: "available" | "unavailable";
+	pidUnavailableReason?: string;
+	terminalId?: string;
+}
+
+function recordBashPids(trace: BashExecutionTrace, pids: readonly number[]): void {
+	if (pids.length === 0) return;
+	trace.pids = [...pids];
+	trace.pidStatus = "available";
+	delete trace.pidUnavailableReason;
+}
+
 type ManagedBashJobCompletion =
 	| {
 			kind: "completed";
@@ -586,10 +610,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 		return "exec";
 	};
-	readonly formatApprovalDetails = (args: unknown, options?: ApprovalDetailsOptions): string[] => {
+	readonly formatApprovalDetails = (args: unknown): string[] => {
 		const rawCommand = (args as Partial<BashToolInput>).command;
 		const command = typeof rawCommand === "string" ? rawCommand : "(missing)";
-		return [`Command: ${truncateApprovalDetail(command, options)}`];
+		return [`Command: ${truncateForPrompt(command)}`];
 	};
 	readonly label = "Bash";
 	readonly loadMode = "essential";
@@ -820,6 +844,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 	#startManagedBashJob(options: {
 		command: string;
+		trace: BashExecutionTrace;
+		onDispatch: (dispatch: BashDispatch) => void;
 		commandCwd: string;
 		timeoutMs: number | undefined;
 		timeoutSec: number | undefined;
@@ -849,12 +875,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			"bash",
 			label,
 			async ({ jobId, signal: runSignal, reportProgress }) => {
+				options.trace.jobId = jobId;
 				// Records the job's progress and shows it on the call's card: plain output
 				// while the call still waits on it, the job frame (`details.async`) once
 				// backgrounded, so the card keeps filling and settles with the job.
 				const report = async (text: string, details: BashProgressDetails): Promise<void> => {
 					latestText = text;
-					const reported = reportProgress(text, { ...details });
+					const currentPids = pids();
+					if (currentPids.length) recordBashPids(options.trace, currentPids);
+					const reported = reportProgress(text, { ...details, execution: { ...options.trace } });
 					// `output` feeds job listings; the card already shows `text`.
 					const { output: _output, ...frame } = details;
 					options.onUpdate?.({
@@ -880,8 +909,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							void report(text, { output: text, async: { state: "running", jobId, type: "bash" } });
 						},
 						onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
+						onDispatch: options.onDispatch,
 						onStart: probe => {
 							pids = probe;
+							recordBashPids(options.trace, probe());
 						},
 					}).finally(() => {
 						pids = NO_PIDS;
@@ -932,6 +963,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				process: { command: options.command, cwd: options.commandCwd, pids: () => pids() },
 			},
 		);
+		options.trace.jobId = jobId;
 
 		return {
 			jobId,
@@ -944,6 +976,85 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	}
 
 	async execute(
+		toolCallId: string,
+		input: BashToolInput,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
+		ctx?: AgentToolContext,
+	): Promise<AgentToolResult<BashToolDetails & { execution: BashExecutionTrace }>> {
+		const effectiveCwd = input.cwd || extractLeadingCdTarget(input.command)?.path;
+		const router = InternalUrlRouter.instance();
+		const redactionCwd = effectiveCwd
+			? router.canHandle(effectiveCwd)
+				? router.normalize(effectiveCwd)
+				: resolveToCwd(effectiveCwd, this.session.cwd)
+			: this.session.cwd;
+		const redactor = await StreamRedactor.load(redactionCwd, []);
+		const trace: BashExecutionTrace = {
+			requestedCommand: redactor.redactCommand(input.command),
+			executedCommand: redactor.redactCommand(input.command),
+			rewritten: false,
+			ownerSessionId: this.session.getSessionId?.() ?? undefined,
+			ownerAgentId: this.session.getAgentId?.() ?? undefined,
+			pidStatus: "unavailable",
+			pidUnavailableReason: "No backend process identity reported.",
+			dispatchUnavailableReason: "Backend has not dispatched yet.",
+		};
+		const onDispatch = (dispatch: BashDispatch) => {
+			trace.executedCommand = redactor.redactCommand(dispatch.command);
+			trace.rewritten = dispatch.command !== input.command || dispatch.program !== null;
+			trace.dispatch = {
+				...dispatch,
+				command: trace.executedCommand,
+				program: dispatch.program === null ? null : redactor.redactRow(dispatch.program),
+				argv:
+					dispatch.argv?.map(arg =>
+						arg === dispatch.command ? redactor.redactCommand(arg) : redactor.redactArgument(arg),
+					) ?? null,
+				cwd: redactor.redactRow(dispatch.cwd),
+			};
+			delete trace.dispatchUnavailableReason;
+		};
+		const decorate = (result: AgentToolResult<BashToolDetails>) => {
+			let content = result.content;
+			if (trace.rewritten) {
+				const identity =
+					[
+						trace.ownerSessionId && `session=${trace.ownerSessionId}`,
+						trace.ownerAgentId && `agent=${trace.ownerAgentId}`,
+						trace.jobId && `job=${trace.jobId}`,
+						trace.pids?.length && `pids=${trace.pids.join(",")}`,
+						trace.terminalId && `terminal=${trace.terminalId}`,
+					]
+						.filter(Boolean)
+						.join(" ") || "unavailable";
+				const notice = `[Command rewritten]\nRequested: ${trace.requestedCommand}\nExecuted: ${trace.executedCommand}\nIdentity: ${identity}`;
+				const firstText = content.findIndex(item => item.type === "text");
+				content = content.slice();
+				const item = content[firstText];
+				if (item?.type === "text") {
+					content[firstText] = { ...item, text: `${notice}\n\n${item.text}` };
+				} else {
+					content.unshift({ type: "text", text: notice });
+				}
+			}
+			return { ...result, content, details: { ...result.details, execution: { ...trace } } };
+		};
+		return decorate(
+			await this.#executeCommand(
+				toolCallId,
+				input,
+				trace,
+				redactor,
+				onDispatch,
+				signal,
+				onUpdate ? update => onUpdate(decorate(update)) : undefined,
+				ctx,
+			),
+		);
+	}
+
+	async #executeCommand(
 		_toolCallId: string,
 		{
 			command: rawCommand,
@@ -954,6 +1065,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			async: rawAsync,
 			pty,
 		}: BashToolInput,
+		trace: BashExecutionTrace,
+		redactor: StreamRedactor,
+		onDispatch: (dispatch: BashDispatch) => void,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
 		ctx?: AgentToolContext,
@@ -985,9 +1099,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			if (!this.#launchEnabled) throw new ToolError("Service launch is disabled in this session.");
 			if (asyncRequested || rawTimeout !== undefined)
 				throw new ToolError("Service mode does not accept async or timeout; use ready.timeout for readiness.");
-		} else if (ready !== undefined) {
-			// Nothing can honour ready without a service to attach it to;
-			// running the command the caller did ask for beats failing the call.
+		} else if (ready !== undefined && (ready.log !== undefined || (ready.port !== undefined && ready.port !== 0))) {
+			// Host/timeout only configure a readiness condition; neither requests one,
+			// and tool-call layers may materialize an unset port as zero. Keep service
+			// validation unchanged, but only warn when a condition was actually ignored.
 			pendingNotices.push("Ignored ready: service-only, and no service name was given.");
 		}
 		if (asyncRequested && !cfgAsyncEnabled.get(this.session.settings)) {
@@ -1013,6 +1128,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (cfgWorktreeClone.get(this.session.settings)) {
 			command = rewriteGitWorktreeAdd(command, resolveCliEntryCmd());
 		}
+		trace.executedCommand = redactor.redactCommand(command);
+		trace.rewritten = command !== rawCommand;
 
 		// Best-effort cache invalidation: drop github-cache rows for any issue/PR
 		// number touched by a mutating `gh` subcommand inside this bash call so
@@ -1064,6 +1181,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 
 		if (name !== undefined) {
+			trace.dispatchUnavailableReason = "Service broker did not report final backend dispatch (legacy broker).";
+			// Only a readiness wait can outlast a steer; without `ready` the start
+			// returns once the process spawns.
 			const service = await startService(
 				this.session,
 				{
@@ -1072,10 +1192,26 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					cwd: commandCwd,
 					pty: pty ?? true,
 					ready,
+					onDispatch,
 				},
 				signal,
+				ready === undefined ? undefined : ctx?.toolCall?.steeringSignal,
 			);
 			const daemon = service.daemon;
+			if (daemon.pid !== undefined) recordBashPids(trace, [daemon.pid]);
+			if (service.readyInterrupted) {
+				// A queued message arrived mid-wait: return so it injects promptly.
+				// The broker keeps starting the service, inspectable via proc://.
+				return {
+					content: [
+						{
+							type: "text",
+							text: `${name}: starting${daemon.pid === undefined ? "" : ` pid=${daemon.pid}`}\nReadiness wait interrupted early to handle an incoming message; the service is still starting and keeps running. Read proc://${name} for status.`,
+						},
+					],
+					details: { service: { name, state: daemon.state, ready: false, timedOut: false, pid: daemon.pid } },
+				};
+			}
 			const lines = [
 				`${daemon.name}: ${daemon.state}${daemon.pid === undefined ? "" : ` pid=${daemon.pid}`}${daemon.readyAt === undefined ? "" : " ready"}`,
 			];
@@ -1084,7 +1220,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					`NOT ready — readiness timed out after ${ready?.timeout ?? 30}s; process state: ${daemon.state}.`,
 				);
 			if (daemon.exitReason) lines.push(`Reason: ${daemon.exitReason}`);
-			if (service.log) lines.push(service.log);
+			const log = await serviceLogs(this.session, name, signal);
+			if (log) lines.push(log);
 			return {
 				content: [{ type: "text", text: lines.join("\n") }],
 				details: {
@@ -1117,6 +1254,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			}
 			const job = this.#startManagedBashJob({
 				command,
+				trace,
+				onDispatch,
 				commandCwd,
 				timeoutMs,
 				timeoutSec,
@@ -1157,6 +1296,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			const startBackgrounded = autoBackgroundWaitMs === 0;
 			const job = this.#startManagedBashJob({
 				command,
+				trace,
+				onDispatch,
 				commandCwd,
 				timeoutMs,
 				timeoutSec,
@@ -1296,6 +1437,14 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				const bridgeCommand = backendPreflight?.command ?? command;
 				const bridgeEnv = backendPreflight?.env;
 				const shellSpawn = wrapShellLineForClientTerminal(bridgeCommand, this.session.settings.getShellConfig());
+				onDispatch({
+					backend: "client-terminal",
+					command: shellSpawn.args[shellSpawn.args.length - 1],
+					program: shellSpawn.command,
+					argv: shellSpawn.args,
+					cwd: commandCwd,
+				});
+				trace.pidUnavailableReason = "Client terminal protocol exposes a terminal handle, not a PID.";
 				const createP = clientBridge.createTerminal({
 					command: shellSpawn.command,
 					args: shellSpawn.args,
@@ -1335,6 +1484,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				}
 
 				handle = createRaced.handle;
+				trace.terminalId = redactor.redactRow(handle.terminalId);
 
 				// Emit partial update so the editor can embed the live terminal card.
 				onUpdate?.({ content: [], details: { terminalId: handle.terminalId } });
@@ -1511,6 +1661,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			pendingNotices.push("pty requested but unavailable in this environment; ran without a terminal");
 		}
 		const wallTimeStart = performance.now();
+		let processProbe = NO_PIDS;
 		const result: BashResult | BashInteractiveResult = interactiveUi
 			? await runInteractiveBashPty(interactiveUi, {
 					// PTY bypasses executeBash, so feed it the direnv-transformed
@@ -1523,6 +1674,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					env: backendPreflight?.env,
 					artifactPath,
 					artifactId,
+					onDispatch,
+					onStart: pid => {
+						if (pid !== undefined) recordBashPids(trace, [pid]);
+						else trace.pidUnavailableReason = "PTY backend did not expose a child PID.";
+					},
 				})
 			: // executeBash runs its OWN direnv preflight internally — pass the RAW
 				// command here so the unset prefix is not applied twice.
@@ -1535,8 +1691,18 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					filesystem: this.#urlFilesystem(signal, approvalTier).shellFilesystem(),
 					artifactPath,
 					artifactId,
-					// Stream the sink's own inline view rather than re-buffering chunks.
-					onPreview: onUpdate ? text => onUpdate({ content: [{ type: "text", text }], details: {} }) : undefined,
+					onDispatch,
+					onStart: probe => {
+						processProbe = probe;
+						const currentPids = probe();
+						recordBashPids(trace, currentPids);
+					},
+					// Capture available process identity even without a UI subscriber.
+					onPreview: text => {
+						const currentPids = processProbe();
+						recordBashPids(trace, currentPids);
+						onUpdate?.({ content: [{ type: "text", text }], details: {} });
+					},
 					onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
 				});
 		const wallTimeMs = performance.now() - wallTimeStart;

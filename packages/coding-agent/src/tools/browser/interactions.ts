@@ -1,9 +1,30 @@
-import * as path from "node:path";
+import type { Protocol } from "devtools-protocol";
 import { untilAborted } from "@oh-my-pi/pi-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import type { ElementHandle, KeyInput, KeyPressOptions, MouseButton, Page } from "puppeteer-core";
+import type {
+	ElementHandle,
+	FileChooser,
+	JSHandle,
+	KeyInput,
+	KeyPressOptions,
+	MouseButton,
+	Page,
+	Realm,
+} from "puppeteer-core";
 import { ToolAbortError, throwIfAborted } from "../tool-errors";
 import { splitKeyCombo, ternKey } from "./tern/keys";
+import { devtoolsFrameId } from "./frames";
+import {
+	createFilePicker,
+	openUploadSources,
+	pickedFiles,
+	refuseFolders,
+	setFileInputPaths,
+	type UploadFileInfo,
+	type UploadRoute,
+	type UploadSource,
+	type UploadStaging,
+} from "./upload-files";
 
 /** Options accepted by coordinate-based mouse clicks. */
 export interface ClickAtOptions {
@@ -51,12 +72,6 @@ interface ClickPoint {
 }
 
 type ActionabilityResult = { ok: true; x: number; y: number } | { ok: false; reason: string; coveredBy?: string };
-
-interface FilePayload {
-	name: string;
-	type: string;
-	data: string;
-}
 
 interface PageRect {
 	left: number;
@@ -118,8 +133,8 @@ interface PageGlobals {
 		pointerEvents: string;
 		opacity: string;
 	};
-	Event: new (type: string, options: { bubbles: boolean }) => unknown;
-	File: new (parts: Uint8Array[], name: string, options: { type: string }) => unknown;
+	Event: new (type: string, options: { bubbles: boolean; composed?: boolean }) => unknown;
+	File: new (parts: Uint8Array[], name: string, options: { type: string; lastModified?: number }) => unknown;
 	DataTransfer: new () => { items: { add(file: unknown): void }; files: unknown };
 	DragEvent: new (type: string, options: { bubbles: boolean; cancelable: boolean; dataTransfer: unknown }) => unknown;
 }
@@ -299,7 +314,13 @@ async function actionableClickPoint(
 	}
 }
 
-/** Click an element only after verifying the dispatched point is not occluded. */
+/**
+ * Click an element only after verifying the dispatched point is not occluded, then confirm the browser
+ * delivered the click to it: the target got the `mousedown` or `click` (a label's forwarded `click` counts
+ * for its control), or the page consumed its `pointerdown` with `preventDefault()`, which suppresses the
+ * mouse events after it. A disabled control gets only an unconsumed `pointerdown` and an inert subtree
+ * nothing, so a click the page never saw fails instead of reporting success.
+ */
 export async function clickElement(
 	handle: ElementHandle,
 	label: string,
@@ -307,12 +328,76 @@ export async function clickElement(
 	options: ClickAtOptions = {},
 ): Promise<void> {
 	const point = await actionableClickPoint(handle, label, signal, options);
-	await untilAborted(signal, () =>
-		handle.frame.page().mouse.click(point.x, point.y, {
-			button: options.button,
-			count: options.clickCount,
+	const watch = await untilAborted(signal, () =>
+		handle.evaluateHandle(el => {
+			interface InputEvent {
+				type: string;
+				defaultPrevented: boolean;
+				composedPath(): unknown[];
+			}
+			type Listen = (type: string, listener: (event: InputEvent) => void, capture: boolean) => void;
+			const target = el as unknown as { addEventListener: Listen; removeEventListener: Listen };
+			const page = globalThis as unknown as { addEventListener: Listen; removeEventListener: Listen };
+			const pointerDowns: InputEvent[] = [];
+			const state = {
+				reached: false,
+				// Read after the click: the page's handlers have run by then.
+				delivered: () => state.reached || pointerDowns.some(event => event.defaultPrevented),
+				stop: () => {},
+			};
+			const record = (event: InputEvent) => {
+				if (event.type === "pointerdown") pointerDowns.push(event);
+				else state.reached = true;
+			};
+			// The target's own listener sees events inside a closed shadow root, which the window's path hides;
+			// the window's sees an event a page handler stops before it reaches the target.
+			const onPage = (event: InputEvent) => {
+				if (event.composedPath().includes(el)) record(event);
+			};
+			const types = ["pointerdown", "mousedown", "click"];
+			for (const type of types) {
+				target.addEventListener(type, record, true);
+				page.addEventListener(type, onPage, true);
+			}
+			state.stop = () => {
+				for (const type of types) {
+					target.removeEventListener(type, record, true);
+					page.removeEventListener(type, onPage, true);
+				}
+			};
+			return state;
 		}),
 	);
+	try {
+		await untilAborted(signal, () =>
+			handle.frame.page().mouse.click(point.x, point.y, {
+				button: options.button,
+				count: options.clickCount,
+			}),
+		);
+	} catch (error) {
+		// The page may be stuck; tidy up without waiting on it.
+		void watch
+			.evaluate(state => state.stop())
+			.catch(() => undefined)
+			.finally(() => watch.dispose().catch(() => undefined));
+		throw error;
+	}
+	// A click that navigated away took the page's record with it; it reached the page. A cancelled call
+	// still fails as cancelled.
+	const delivered = await untilAborted(signal, () =>
+		watch.evaluate(state => {
+			state.stop();
+			return state.delivered();
+		}),
+	).catch((error: unknown) => {
+		if (signal?.aborted) throw error;
+		return true;
+	});
+	await watch.dispose().catch(() => undefined);
+	if (!delivered) {
+		throw new ToolError(`${label}: the browser did not deliver the click to the element (disabled or inert)`);
+	}
 }
 
 /**
@@ -391,39 +476,195 @@ export async function fillViaHandle(
 	await untilAborted(signal, () => type(value));
 }
 
-/** Resolve text-query matches to the first visible clickable candidate in document order. */
-export async function resolveActionableQueryHandlerClickTarget(
-	handles: ElementHandle[],
-): Promise<ElementHandle | null> {
-	const candidates: Array<{ handle: ElementHandle; x: number; y: number; owned: boolean }> = [];
-	for (const handle of handles) {
-		let candidate = handle;
-		let owned = false;
-		try {
-			const proxy = await handle.evaluateHandle(el =>
-				(el as Element).closest('a,button,[role="button"],[role="link"],input[type="button"],input[type="submit"]'),
-			);
-			const element = proxy.asElement();
-			if (element) {
-				candidate = element;
-				owned = candidate !== handle;
-			} else await proxy.dispose();
-			const rect = (await candidate.evaluate(el => {
-				const box = (el as Element).getBoundingClientRect();
-				return { x: box.left, y: box.top, width: box.width, height: box.height };
-			})) as { x: number; y: number; width: number; height: number };
-			if (rect.width >= 1 && rect.height >= 1 && (await candidate.isIntersectingViewport())) {
-				candidates.push({ handle: candidate, x: rect.x, y: rect.y, owned });
-			} else if (owned) await candidate.dispose().catch(() => undefined);
-		} catch {
-			if (owned) await candidate.dispose().catch(() => undefined);
-		}
-	}
-	candidates.sort((a, b) => a.y - b.y || a.x - b.x);
-	const winner = candidates.shift();
+interface QueryCandidate {
+	handle: ElementHandle;
+	/** Document coordinates, so candidates measured at different scroll offsets still compare. */
+	x: number;
+	y: number;
+	onScreen: boolean;
+	/** Shown only as a strip at an edge; see {@link MeasuredBox.edgeOnly}. */
+	edgeOnly: boolean;
+	owned: boolean;
+}
+
+async function disposeOwned(candidates: Iterable<QueryCandidate>): Promise<void> {
 	for (const candidate of candidates) {
 		if (candidate.owned) await candidate.handle.dispose().catch(() => undefined);
 	}
+}
+
+interface MeasuredBox {
+	x: number;
+	y: number;
+	sized: boolean;
+	onScreen: boolean;
+	/** Missed by every interior probe but hit half a pixel inside an edge, as a strip a scroll container leaves in view is. */
+	edgeOnly: boolean;
+}
+
+/**
+ * Runs in the page: the element's document position, whether it has a box, and whether the browser shows
+ * it anywhere in the viewport. Visibility is the renderer's own hit test at a few points of each on-screen
+ * fragment, landing on the element or inside it, so every clip, transform, top layer and containment rule
+ * is the browser's. An element hit testing cannot see (`pointer-events: none`, `visibility: hidden`, inert)
+ * is not shown.
+ * Self-contained, since Puppeteer serializes it.
+ */
+function measureBoxInPage(el: unknown): MeasuredBox {
+	const element = el as unknown as PageElement;
+	const page = globalThis as unknown as PageGlobals & { scrollX: number; scrollY: number };
+	const rect = element.getBoundingClientRect();
+	const inViewport = (r: PageRect) => ({
+		left: Math.max(0, r.left),
+		top: Math.max(0, r.top),
+		right: Math.min(page.innerWidth, r.right),
+		bottom: Math.min(page.innerHeight, r.bottom),
+	});
+	const shown = Array.from(element.getClientRects())
+		.map(inViewport)
+		.filter(r => r.right - r.left >= 1 && r.bottom - r.top >= 1);
+	const style = page.getComputedStyle(element);
+	const hitTestable =
+		style.pointerEvents !== "none" && style.visibility !== "hidden" && style.visibility !== "collapse";
+	const hitsElement = (x: number, y: number): boolean => {
+		let hit = page.document.elementFromPoint(x, y);
+		for (let depth = 0; hit?.shadowRoot && depth < 16; depth++) {
+			const nested = hit.shadowRoot.elementFromPoint(x, y);
+			if (!nested || nested === hit) break;
+			hit = nested;
+		}
+		for (let node = hit; node; node = node.parentElement ?? node.getRootNode().host ?? null) {
+			if (node === element) return true;
+		}
+		return false;
+	};
+	// The resolver still falls back to a match that is not shown, so the click's actionability check says why.
+	const hitAny = (points: (r: { left: number; right: number; top: number; bottom: number }) => number[][]) =>
+		hitTestable && shown.some(r => points(r).some(([x, y]) => hitsElement(x, y)));
+	const grid = (xs: number[], ys: number[]) => xs.flatMap(x => ys.map(y => [x, y]));
+	const interior = (start: number, end: number) => [0.5, 0.15, 0.85].map(f => start + (end - start) * f);
+	const onScreen = hitAny(r => grid(interior(r.left, r.right), interior(r.top, r.bottom)));
+	// Every shown rect is at least 1px on each axis, so half a pixel in stays inside it.
+	const edgeOnly =
+		!onScreen &&
+		hitAny(r => {
+			const xs = interior(r.left, r.right);
+			const ys = interior(r.top, r.bottom);
+			const edgeXs = [r.left + 0.5, r.right - 0.5];
+			const edgeYs = [r.top + 0.5, r.bottom - 0.5];
+			return [...grid(edgeXs, [...ys, ...edgeYs]), ...grid(xs, edgeYs)];
+		});
+	return {
+		x: rect.left + page.scrollX,
+		y: rect.top + page.scrollY,
+		sized: rect.width >= 1 && rect.height >= 1,
+		onScreen,
+		edgeOnly,
+	};
+}
+
+/**
+ * Lift a text match to its clickable ancestor and measure it, or return null for a match with no box.
+ * `isIntersectingViewport` waits on an `IntersectionObserver` callback that background tabs never
+ * deliver, so visibility comes from {@link measureBoxInPage}'s synchronous hit test instead.
+ */
+async function measureQueryCandidate(handle: ElementHandle, signal?: AbortSignal): Promise<QueryCandidate | null> {
+	let candidate = handle;
+	let owned = false;
+	try {
+		const proxy = await untilAborted(signal, () =>
+			handle.evaluateHandle(el =>
+				(el as Element).closest('a,button,[role="button"],[role="link"],input[type="button"],input[type="submit"]'),
+			),
+		);
+		const element = proxy.asElement();
+		if (element) {
+			candidate = element;
+			owned = candidate !== handle;
+		} else await proxy.dispose();
+		const box = await untilAborted(signal, () => candidate.evaluate(measureBoxInPage));
+		if (box.sized) {
+			return { handle: candidate, x: box.x, y: box.y, onScreen: box.onScreen, edgeOnly: box.edgeOnly, owned };
+		}
+	} catch (error) {
+		if (owned) await candidate.dispose().catch(() => undefined);
+		if (signal?.aborted) throw error;
+		return null;
+	}
+	if (owned) await candidate.dispose().catch(() => undefined);
+	return null;
+}
+
+/**
+ * Scroll an off-screen match into view: `shown` when the browser's hit test finds it there, `reachable`
+ * when the actionability check would let a click go at it (it also accepts a hit on an ancestor, which is
+ * what a clipped or inert match yields) or names what covers it.
+ */
+async function probeOffScreen(
+	handle: ElementHandle,
+	signal?: AbortSignal,
+): Promise<{ shown: boolean; reachable: boolean }> {
+	try {
+		await untilAborted(signal, () =>
+			handle.evaluate(el => {
+				const element = el as unknown as PageElement;
+				element.scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
+			}),
+		);
+		const actionable = await isClickActionable(handle, signal);
+		const reachable = actionable.ok || actionable.coveredBy !== undefined;
+		if (!actionable.ok) return { shown: false, reachable };
+		const box = await untilAborted(signal, () => handle.evaluate(measureBoxInPage));
+		return { shown: box.onScreen, reachable };
+	} catch (error) {
+		if (signal?.aborted) throw error;
+		return { shown: false, reachable: false };
+	}
+}
+
+/**
+ * Resolve text-query matches to the first match the browser shows on screen, in document order. A match
+ * shown only as a strip at an edge counts once scrolling it into view lets the browser hit its interior,
+ * as with a strip a scroll container leaves; one an overlay covers stays covered there. When none is on
+ * screen, off-screen matches are scrolled into view in document order and the first one shown wins;
+ * failing that, the first one a click could be aimed at, then the first match, so the click itself reports
+ * what stops it.
+ */
+export async function resolveActionableQueryHandlerClickTarget(
+	handles: ElementHandle[],
+	signal?: AbortSignal,
+): Promise<ElementHandle | null> {
+	const candidates: QueryCandidate[] = [];
+	let winner: QueryCandidate | undefined;
+	try {
+		for (const handle of handles) {
+			const candidate = await measureQueryCandidate(handle, signal);
+			if (candidate) candidates.push(candidate);
+		}
+		candidates.sort((a, b) => a.y - b.y || a.x - b.x);
+		for (const candidate of candidates) {
+			if (candidate.onScreen || (candidate.edgeOnly && (await probeOffScreen(candidate.handle, signal)).shown)) {
+				winner = candidate;
+				break;
+			}
+		}
+		if (!winner) {
+			let reachable: QueryCandidate | undefined;
+			for (const candidate of candidates) {
+				const probe = await probeOffScreen(candidate.handle, signal);
+				if (probe.shown) {
+					winner = candidate;
+					break;
+				}
+				if (probe.reachable) reachable ??= candidate;
+			}
+			winner ??= reachable ?? candidates[0];
+		}
+	} catch (error) {
+		await disposeOwned(candidates);
+		throw error;
+	}
+	await disposeOwned(candidates.filter(candidate => candidate !== winner));
 	return winner?.handle ?? null;
 }
 
@@ -442,7 +683,7 @@ export async function clickQueryHandlerText(
 		const handles = (await untilAborted(clickSignal, () => page.$$(selector))) as ElementHandle[];
 		let target: ElementHandle | null = null;
 		try {
-			target = await resolveActionableQueryHandlerClickTarget(handles);
+			target = await resolveActionableQueryHandlerClickTarget(handles, clickSignal);
 			if (!target) {
 				await untilAborted(clickSignal, () => Bun.sleep(50));
 				continue;
@@ -625,14 +866,295 @@ export async function selectElementOptions(
 	return outcome.selected;
 }
 
-/** Upload files through an input, native chooser trigger, or synthetic drop-zone event sequence. */
-export async function uploadFilesToElement(
+/** How long a click has to open a file chooser before the target counts as a drop zone. */
+const FILE_CHOOSER_WAIT_MS = 400;
+
+/**
+ * Raw bytes per call into the page. Each call is one CDP message carrying its chunk base64-encoded, so an upload of any
+ * size stays far below the websocket message caps on the way (the relay's is 256 MiB).
+ */
+const UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
+
+/** Chunk calls in flight at once, so the CDP round trips overlap. */
+const UPLOAD_CHUNKS_IN_FLIGHT = 4;
+
+/** Store chunk `seq` of file `index` of a page-side upload. Runs in the isolated world. */
+function storeUploadChunk(parts: Uint8Array[][], index: number, seq: number, data: string): void {
+	parts[index] ??= [];
+	// Chrome before 140 has no `fromBase64`.
+	parts[index][seq] =
+		typeof Uint8Array.fromBase64 === "function"
+			? Uint8Array.fromBase64(data)
+			: Uint8Array.from(atob(data), character => character.charCodeAt(0));
+}
+
+/** Build an upload's files from their stored chunks. Runs in the isolated world. */
+function buildUploadFiles(parts: Uint8Array[][], files: UploadFileInfo[]): unknown[] {
+	const page = globalThis as unknown as PageGlobals;
+	return files.map(
+		(file, index) =>
+			new page.File(parts[index] ?? [], file.name, { type: file.type, lastModified: file.lastModified }),
+	);
+}
+
+/** Why a file input cannot take `count` files, or null. Runs in the page. */
+function fileInputRefusal(el: unknown, count: number): string | null {
+	const element = el as PageElement & { multiple: boolean };
+	if (count > 1 && !element.multiple) return "Multiple file uploads only work with <input type=file multiple>";
+	if (element.tagName !== "INPUT" || element.type?.toLowerCase() !== "file") return "Node is not a file input element";
+	return null;
+}
+
+/** Give a file input `files` and fire the events a user's pick would; returns why it refused. Runs in the isolated world. */
+function assignInputFiles(el: unknown, files: unknown[]): string | null {
+	const element = el as PageElement & { multiple: boolean };
+	const page = globalThis as unknown as PageGlobals;
+	if (files.length > 1 && !element.multiple) return "Multiple file uploads only work with <input type=file multiple>";
+	if (element.tagName !== "INPUT" || element.type?.toLowerCase() !== "file") return "Node is not a file input element";
+	const transfer = new page.DataTransfer();
+	for (const file of files) transfer.items.add(file);
+	element.files = transfer.files;
+	element.dispatchEvent(new page.Event("input", { bubbles: true, composed: true }));
+	element.dispatchEvent(new page.Event("change", { bubbles: true }));
+	return null;
+}
+
+/** Drop `files` on an element through the drag events a user's drop fires. Runs in the isolated world. */
+function dropUploadFiles(el: unknown, files: unknown[]): void {
+	const element = el as PageElement;
+	const page = globalThis as unknown as PageGlobals;
+	const transfer = new page.DataTransfer();
+	for (const file of files) transfer.items.add(file);
+	for (const type of ["dragenter", "dragover", "drop"]) {
+		element.dispatchEvent(new page.DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: transfer }));
+	}
+}
+
+/**
+ * Stream files into `realm` in chunks, several calls in flight, and return a handle to the built `File` array. The
+ * isolated world builds them, so the `File` and base64 decoding a page may replace are never the ones used.
+ */
+async function streamUploadFiles(
+	realm: Realm,
+	sources: UploadSource[],
+	signal: AbortSignal | undefined,
+): Promise<JSHandle<unknown[]>> {
+	const parts = await untilAborted(signal, () => realm.evaluateHandle(() => [] as Uint8Array[][]));
+	try {
+		const chunks = sources.flatMap(({ file, size }, index) =>
+			Array.from({ length: Math.ceil(size / UPLOAD_CHUNK_BYTES) }, (_, seq) => ({ file, index, seq })),
+		);
+		// The first failed chunk stops the others.
+		const stop = new AbortController();
+		const chunkSignal = signal ? AbortSignal.any([signal, stop.signal]) : stop.signal;
+		let next = 0;
+		const send = async (): Promise<void> => {
+			while (next < chunks.length) {
+				const { file, index, seq } = chunks[next++]!;
+				const start = seq * UPLOAD_CHUNK_BYTES;
+				const bytes = await untilAborted(chunkSignal, () =>
+					file.slice(start, start + UPLOAD_CHUNK_BYTES).arrayBuffer(),
+				);
+				const data = Buffer.from(bytes).toString("base64");
+				await untilAborted(chunkSignal, () => parts.evaluate(storeUploadChunk, index, seq, data));
+			}
+		};
+		const senders = Math.min(UPLOAD_CHUNKS_IN_FLIGHT, chunks.length);
+		await Promise.all(
+			Array.from({ length: senders }, () =>
+				send().catch(error => {
+					stop.abort(error);
+					throw error;
+				}),
+			),
+		);
+		const files = sources.map(source => source.info);
+		return await untilAborted(signal, () => realm.evaluateHandle(buildUploadFiles, parts, files));
+	} finally {
+		await parts.dispose().catch(() => undefined);
+	}
+}
+
+/** Fill a detached picker with `paths` and return its files, which the browser built from the paths itself. */
+async function pickFiles(realm: Realm, paths: string[], signal: AbortSignal | undefined): Promise<JSHandle<unknown[]>> {
+	const picker = await untilAborted(signal, () => realm.evaluateHandle(createFilePicker));
+	try {
+		const input = picker.asElement();
+		if (!input) throw new ToolError("Could not create a file picker to drop files from");
+		await untilAborted(signal, () => setFileInputPaths(input, paths));
+		return await untilAborted(signal, () => realm.evaluateHandle(pickedFiles, picker));
+	} finally {
+		await picker.dispose().catch(() => undefined);
+	}
+}
+
+/** Hand a file input the files: staged copies' paths, or contents streamed into the isolated world. */
+async function deliverToInput(
+	input: ElementHandle,
+	sources: UploadSource[],
+	route: UploadRoute,
+	staging: UploadStaging,
+	signal: AbortSignal | undefined,
+): Promise<void> {
+	if (route === "paths") {
+		const staged = await staging.stage(sources, signal);
+		await untilAborted(signal, () => setFileInputPaths(input, staged));
+		return;
+	}
+	const realm = input.frame.isolatedRealm();
+	const target = await untilAborted(signal, () => realm.adoptHandle(input));
+	try {
+		const files = await streamUploadFiles(realm, sources, signal);
+		try {
+			const refusal = await untilAborted(signal, () => realm.evaluate(assignInputFiles, target, files));
+			if (refusal) throw new ToolError(refusal);
+		} finally {
+			await files.dispose().catch(() => undefined);
+		}
+	} finally {
+		await target.dispose().catch(() => undefined);
+	}
+}
+
+/** Drop the files on an element, built from staged copies by a detached picker or from streamed contents. */
+async function deliverToDropZone(
+	zone: ElementHandle,
+	sources: UploadSource[],
+	route: UploadRoute,
+	staging: UploadStaging,
+	signal: AbortSignal | undefined,
+): Promise<void> {
+	const realm = zone.frame.isolatedRealm();
+	const target = await untilAborted(signal, () => realm.adoptHandle(zone));
+	try {
+		const files =
+			route === "paths"
+				? await pickFiles(realm, await staging.stage(sources, signal), signal)
+				: await streamUploadFiles(realm, sources, signal);
+		try {
+			await untilAborted(signal, () => realm.evaluate(dropUploadFiles, target, files));
+		} finally {
+			await files.dispose().catch(() => undefined);
+		}
+	} finally {
+		await target.dispose().catch(() => undefined);
+	}
+}
+
+/**
+ * An upload whose target is found. Finding it runs under the action deadline; `deliver` hands over the files, which for
+ * streamed contents takes time in proportion to their size, so it runs under its own, longer one.
+ */
+export interface PreparedUpload {
+	/** Bytes `deliver` hands over. */
+	readonly bytes: number;
+	deliver(signal: AbortSignal): Promise<void>;
+	/** Release what finding the target held: an unfilled chooser is cancelled. */
+	dispose(): Promise<void>;
+}
+
+function preparedUpload(
+	sources: UploadSource[],
+	deliver: (signal: AbortSignal) => Promise<void>,
+	dispose: () => Promise<void> = async () => {},
+): PreparedUpload {
+	return { bytes: sources.reduce((sum, source) => sum + source.size, 0), deliver, dispose };
+}
+
+/** Prepare an upload into a file input: open the files and check the input takes that many. */
+export async function prepareInputUpload(
+	input: ElementHandle,
+	absolutePaths: string[],
+	route: UploadRoute,
+	staging: UploadStaging,
+	signal?: AbortSignal,
+): Promise<PreparedUpload> {
+	const sources = await openUploadSources(absolutePaths, signal);
+	if (route === "contents") refuseFolders(sources);
+	const refusal = await untilAborted(signal, () => input.evaluate(fileInputRefusal, sources.length));
+	if (refusal) throw new ToolError(refusal);
+	return preparedUpload(sources, sig => deliverToInput(input, sources, route, staging, sig));
+}
+
+/** Pages with a chooser-trigger upload in flight: a second one would catch the first one's chooser. */
+const pagesAwaitingChooser = new WeakSet<Page>();
+
+/**
+ * Click `handle` and return the file input of the chooser it opens, adopted into the isolated world; null when no
+ * chooser opened. Puppeteer's FileChooser accepts only paths and hides its input, so the chooser is caught on a CDP
+ * session of our own, which lets go of the interception as soon as the input is adopted.
+ */
+async function catchChooserInput(
+	page: Page,
+	handle: ElementHandle,
+	label: string,
+	signal: AbortSignal | undefined,
+): Promise<ElementHandle | null> {
+	let timer: NodeJS.Timeout | undefined;
+	const creating = page.createCDPSession();
+	const session = await untilAborted(signal, () => creating).catch(error => {
+		// An abort does not stop the attach; detach the session once it arrives.
+		void creating.then(late => late.detach()).catch(() => undefined);
+		throw error;
+	});
+	try {
+		const { promise: opened, resolve } = Promise.withResolvers<Protocol.Page.FileChooserOpenedEvent | null>();
+		session.once("Page.fileChooserOpened", resolve);
+		await untilAborted(signal, () => session.send("Page.enable"));
+		await untilAborted(signal, () => session.send("Page.setInterceptFileChooserDialog", { enabled: true }));
+		// The wait covers the click, so a target that only becomes clickable later counts as a drop zone.
+		timer = setTimeout(() => resolve(null), FILE_CHOOSER_WAIT_MS);
+		await clickElement(handle, label, signal);
+		const chooser = await untilAborted(signal, () => opened);
+		if (!chooser) return null;
+		if (chooser.backendNodeId === undefined) {
+			throw new ToolError(
+				`${label} opened a File System Access picker (showOpenFilePicker), which automation cannot fill; upload through the page's <input type=file> or drop zone instead`,
+			);
+		}
+		const { backendNodeId } = chooser;
+		const frame = page.frames().find(candidate => devtoolsFrameId(candidate) === chooser.frameId);
+		if (!frame) throw new ToolError(`${label} opened a file chooser in a frame that has since gone away`);
+		const node = await untilAborted(signal, () => frame.isolatedRealm().adoptBackendNode(backendNodeId));
+		const input = node.asElement();
+		if (!input) {
+			await node.dispose().catch(() => undefined);
+			throw new ToolError("Node is not a file input element");
+		}
+		return input;
+	} finally {
+		clearTimeout(timer);
+		// The relay serves every session of a tab from one debugger attachment, so detaching alone leaves it on.
+		await session.send("Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => undefined);
+		await session.detach().catch(() => undefined);
+	}
+}
+
+/** Click `handle` and return the chooser it opens through Puppeteer, which fills it with paths; null when none opened. */
+async function catchChooser(
+	page: Page,
+	handle: ElementHandle,
+	label: string,
+	signal: AbortSignal | undefined,
+): Promise<FileChooser | null> {
+	const chooserPromise = page.waitForFileChooser({ timeout: FILE_CHOOSER_WAIT_MS }).catch(() => null);
+	await clickElement(handle, label, signal);
+	return await untilAborted(signal, () => chooserPromise);
+}
+
+/**
+ * Find what takes an upload through `handle`: the file input itself, the chooser its click opens, or else the element
+ * as a drop zone. `route` is how the browser gets the files; see {@link UploadStaging.route}.
+ */
+export async function prepareElementUpload(
 	page: Page,
 	handle: ElementHandle,
 	absolutePaths: string[],
 	label: string,
+	route: UploadRoute,
+	staging: UploadStaging,
 	signal?: AbortSignal,
-): Promise<void> {
+): Promise<PreparedUpload> {
 	const inputType = (await untilAborted(signal, () =>
 		handle.evaluate(el => {
 			const element = el as unknown as PageElement;
@@ -640,43 +1162,56 @@ export async function uploadFilesToElement(
 		}),
 	)) as { tag: string; type: string };
 	if (inputType.tag === "INPUT" && inputType.type.toLowerCase() === "file") {
-		await untilAborted(signal, () =>
-			(handle as unknown as { uploadFile: (...paths: string[]) => Promise<void> }).uploadFile(...absolutePaths),
-		);
-		return;
+		return await prepareInputUpload(handle, absolutePaths, route, staging, signal);
 	}
+	const sources = await openUploadSources(absolutePaths, signal);
+	if (route === "contents") refuseFolders(sources);
 
-	const chooserPromise = page.waitForFileChooser({ timeout: 400 }).catch(() => null);
-	await clickElement(handle, label, signal);
-	const chooser = await untilAborted(signal, () => chooserPromise);
-	if (chooser) {
-		await untilAborted(signal, () => chooser.accept(absolutePaths));
-		return;
+	if (pagesAwaitingChooser.has(page)) {
+		throw new ToolError(`${label} cannot run while another uploadFile on this tab waits for its file chooser`);
 	}
-
-	const files: FilePayload[] = [];
-	for (const absolute of absolutePaths) {
-		throwIfAborted(signal);
-		const file = Bun.file(absolute);
-		const data = Buffer.from(await file.arrayBuffer()).toString("base64");
-		files.push({ name: path.basename(absolute), type: file.type || "application/octet-stream", data });
-	}
-	await untilAborted(signal, () =>
-		handle.evaluate((el, payloads) => {
-			const element = el as unknown as PageElement;
-			const page = globalThis as unknown as PageGlobals;
-			const transfer = new page.DataTransfer();
-			for (const payload of payloads) {
-				const bytes = Uint8Array.from(atob(payload.data), character => character.charCodeAt(0));
-				transfer.items.add(new page.File([bytes], payload.name, { type: payload.type }));
-			}
-			for (const type of ["dragenter", "dragover", "drop"]) {
-				element.dispatchEvent(
-					new page.DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: transfer }),
+	pagesAwaitingChooser.add(page);
+	try {
+		if (route === "paths") {
+			const chooser = await catchChooser(page, handle, label, signal);
+			if (chooser) {
+				let handled = false;
+				return preparedUpload(
+					sources,
+					async sig => {
+						const staged = await staging.stage(sources, sig);
+						// Handled only once accept starts: a cancel during staging leaves the chooser to `dispose`.
+						await untilAborted(sig, () => {
+							handled = true;
+							return chooser.accept(staged);
+						});
+					},
+					async () => {
+						if (!handled) await chooser.cancel().catch(() => undefined);
+					},
 				);
 			}
-		}, files),
-	);
+		} else {
+			const input = await catchChooserInput(page, handle, label, signal);
+			if (input) {
+				try {
+					const refusal = await untilAborted(signal, () => input.evaluate(fileInputRefusal, sources.length));
+					if (refusal) throw new ToolError(refusal);
+				} catch (error) {
+					await input.dispose().catch(() => undefined);
+					throw error;
+				}
+				return preparedUpload(
+					sources,
+					sig => deliverToInput(input, sources, route, staging, sig),
+					() => input.dispose().catch(() => undefined),
+				);
+			}
+		}
+	} finally {
+		pagesAwaitingChooser.delete(page);
+	}
+	return preparedUpload(sources, sig => deliverToDropZone(handle, sources, route, staging, sig));
 }
 
 /** Press a keyboard key without releasing it. */

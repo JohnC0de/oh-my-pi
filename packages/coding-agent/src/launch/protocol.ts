@@ -5,6 +5,7 @@ import {
 	type DaemonSpec,
 	type DaemonSnapshot,
 } from "@oh-my-pi/pi-tui/tools/daemon";
+import type { BashDispatch } from "../exec/bash-executor";
 /**
  * Cross-process daemon broker protocol shared by the tool, client, and broker.
  */
@@ -29,7 +30,14 @@ export type DaemonSignal = "SIGINT" | "SIGTERM" | "SIGHUP" | "SIGQUIT" | "SIGKIL
 /** Typed broker operation sent over the authenticated socket. */
 export type DaemonOperation =
 	| { op: "ping" }
-	| { op: "start"; spec: DaemonSpec; owner?: string; replace?: boolean }
+	| {
+			op: "start";
+			spec: DaemonSpec;
+			owner?: string;
+			replace?: boolean;
+			/** `false` answers once the process launches; follow with a `wait` for readiness. Legacy brokers ignore it and wait. */
+			awaitReady?: boolean;
+	  }
 	| { op: "list" }
 	| {
 			op: "logs";
@@ -55,12 +63,14 @@ export type DaemonOperation =
 	| { op: "restart"; name: string }
 	| { op: "mode"; name: string; mode: "persist" | "session" | "detached" }
 	| { op: "describe"; name: string }
+	/** Abort this connection's in-flight `wait`/follow-`logs` request `requestId`. Legacy brokers reject it. */
+	| { op: "cancel"; requestId: string }
 	| { op: "shutdown" };
 
 /** Typed broker result decoded before it reaches tool code. */
 export type DaemonRpcResult =
 	| { op: "ping"; projectDir: string }
-	| { op: "start"; daemon: DaemonSnapshot; readyTimedOut: boolean }
+	| { op: "start"; daemon: DaemonSnapshot; readyTimedOut: boolean; dispatch?: BashDispatch }
 	| { op: "list"; daemons: DaemonSnapshot[] }
 	| {
 			op: "logs";
@@ -80,6 +90,7 @@ export type DaemonRpcResult =
 	| { op: "restart"; daemon: DaemonSnapshot }
 	| { op: "mode"; daemon: DaemonSnapshot }
 	| { op: "describe"; daemon: DaemonSnapshot; spec: DaemonSpec }
+	| { op: "cancel"; cancelled: boolean }
 	| { op: "shutdown" };
 
 /** Authenticated request envelope used by socket clients. */
@@ -316,6 +327,8 @@ function parseDaemonOperation(value: unknown): DaemonOperation {
 				spec: parseDaemonSpec(source.spec),
 				owner: optionalString(source.owner, "operation.owner"),
 				replace: source.replace === undefined ? undefined : booleanValue(source.replace, "operation.replace"),
+				awaitReady:
+					source.awaitReady === undefined ? undefined : booleanValue(source.awaitReady, "operation.awaitReady"),
 			};
 		case "logs":
 			return {
@@ -360,6 +373,8 @@ function parseDaemonOperation(value: unknown): DaemonOperation {
 		case "restart":
 		case "describe":
 			return { op, name: stringValue(source.name, "operation.name") };
+		case "cancel":
+			return { op, requestId: stringValue(source.requestId, "operation.requestId") };
 		case "mode": {
 			const mode = stringValue(source.mode, "operation.mode");
 			if (mode !== "persist" && mode !== "session" && mode !== "detached")
@@ -382,6 +397,7 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 				op: "start",
 				daemon: parseDaemonSnapshot(source.daemon),
 				readyTimedOut: booleanValue(source.readyTimedOut, "result.readyTimedOut"),
+				dispatch: source.dispatch === undefined ? undefined : parseServiceDispatch(source.dispatch),
 			};
 		case "list": {
 			if (!Array.isArray(source.daemons)) throw new Error("result.daemons must be an array");
@@ -421,7 +437,21 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 				daemon: parseDaemonSnapshot(source.daemon),
 				spec: parseDaemonSpec(source.spec),
 			};
+		case "cancel":
+			return { op: "cancel", cancelled: booleanValue(source.cancelled, "result.cancelled") };
 		case "shutdown":
 			return { op: "shutdown" };
 	}
+}
+
+function parseServiceDispatch(value: unknown): BashDispatch {
+	const source = record(value, "result.dispatch");
+	if (source.backend !== "service") throw new Error("result.dispatch.backend must be service");
+	return {
+		backend: "service",
+		command: rawString(source.command, "result.dispatch.command"),
+		program: stringValue(source.program, "result.dispatch.program"),
+		argv: stringArray(source.argv, "result.dispatch.argv"),
+		cwd: stringValue(source.cwd, "result.dispatch.cwd"),
+	};
 }

@@ -42,6 +42,56 @@ mod windows_block_clone;
 mod zfs;
 
 pub use diff::{ChangeKind, Diff, FileChange};
+pub use tree::validate_destination;
+
+/// Bounded counters for a clone; bytes are logical file bytes, not physical
+/// I/O. Bulk filesystem clones do not enumerate entries (`traversal_measured =
+/// false`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CloneStats {
+	pub traversal_measured:  bool,
+	pub entries_visited:     u64,
+	pub directories_created: u64,
+	pub files_copied:        u64,
+	pub bytes_copied:        u64,
+	pub symlinks_copied:     u64,
+	pub entries_skipped:     u64,
+	/// Wall time in the native clone itself, excluding caller
+	/// policy/reconciliation.
+	pub total_ms:            f64,
+	pub policy_ms:           f64,
+	pub reconcile_ms:        f64,
+}
+
+/// A failed clone retains the work measured before the backend returned its
+/// error.
+#[derive(Debug, Clone)]
+pub struct CloneError {
+	pub error: IsoError,
+	pub stats: CloneStats,
+}
+
+impl CloneError {
+	pub const fn is_unavailable(&self) -> bool {
+		self.error.is_unavailable()
+	}
+
+	pub fn message(&self) -> &str {
+		self.error.message()
+	}
+}
+
+impl fmt::Display for CloneError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		fmt::Display::fmt(&self.error, f)
+	}
+}
+
+impl std::error::Error for CloneError {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		Some(&self.error)
+	}
+}
 
 /// Stable identifier for which backend a build was compiled with.
 ///
@@ -271,8 +321,8 @@ pub trait IsolationBackend: Send + Sync {
 
 	fn start(&self, lower: &Path, merged: &Path) -> IsoResult<()>;
 
-	/// Clone `lower` into `merged` copy-on-write, omitting named top-level
-	/// entries.
+	/// Clone `lower` into `merged` copy-on-write, omitting explicitly named
+	/// source-relative entries (and their descendants).
 	fn clone_tree(
 		&self,
 		_lower: &Path,
@@ -280,6 +330,17 @@ pub trait IsolationBackend: Send + Sync {
 		_skip: &[&std::ffi::OsStr],
 	) -> IsoResult<()> {
 		Err(IsoError::unavailable(format!("{} cannot clone a directory tree in place", self.kind())))
+	}
+
+	/// Clone with constant-space counters and elapsed wall time, including on
+	/// error.
+	fn clone_tree_with_stats(
+		&self,
+		lower: &Path,
+		merged: &Path,
+		skip: &[&std::ffi::OsStr],
+	) -> Result<CloneStats, CloneError> {
+		tree::measure_clone(|| self.clone_tree(lower, merged, skip))
 	}
 
 	fn stop(&self, merged: &Path) -> IsoResult<()>;

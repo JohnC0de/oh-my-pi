@@ -35,8 +35,11 @@ export type ShellToken = { kind: "word"; raw: string; value: string } | { kind: 
  * and reassemble the command. Word boundaries match {@link tokenizeShellSegments}: `value` is the
  * quote/escape-removed word, `raw` its verbatim spelling; separators are runs of spaces, tabs, and
  * the operator characters `\n ; & | ( )`.
+ * `decodeAnsiC` additionally decodes `$'...'` for secret matching only. It never
+ * evaluates expansions, and is opt-in so approval and rewriting callers retain
+ * their existing conservative token values. `raw` always stays byte-for-byte.
  */
-export function lexShellCommand(command: string): ShellToken[] {
+export function lexShellCommand(command: string, options?: { decodeAnsiC?: boolean }): ShellToken[] {
 	const tokens: ShellToken[] = [];
 	let value = "";
 	let wordStart = -1;
@@ -92,7 +95,11 @@ export function lexShellCommand(command: string): ShellToken[] {
 			continue;
 		}
 		startWord(i);
-		if (ch === "'") {
+		if (options?.decodeAnsiC && ch === "$" && command[i + 1] === "'") {
+			const quoted = readAnsiCQuoted(command, i + 2);
+			value += quoted.value;
+			i = quoted.end;
+		} else if (ch === "'") {
 			inSingle = true;
 		} else if (ch === '"') {
 			inDouble = true;
@@ -106,6 +113,82 @@ export function lexShellCommand(command: string): ShellToken[] {
 	endWord(command.length);
 	if (separatorStart >= 0) tokens.push({ kind: "separator", raw: command.slice(separatorStart) });
 	return tokens;
+}
+
+const ANSI_C_ESCAPES: Readonly<Record<string, number>> = {
+	a: 7,
+	b: 8,
+	e: 27,
+	E: 27,
+	f: 12,
+	n: 10,
+	r: 13,
+	t: 9,
+	v: 11,
+	"\\": 92,
+	"'": 39,
+	'"': 34,
+	"?": 63,
+};
+
+/** Decode bytes for matching only; never interpret substitutions or execute a shell. */
+function readAnsiCQuoted(command: string, start: number): { value: string; end: number } {
+	const bytes: number[] = [];
+	let i = start;
+	for (; i < command.length && command[i] !== "'"; i++) {
+		if (command[i] !== "\\" || i + 1 === command.length) {
+			const point = command.codePointAt(i);
+			if (point === undefined) break;
+			const character = String.fromCodePoint(point);
+			bytes.push(...Buffer.from(character));
+			i += character.length - 1;
+			continue;
+		}
+		const escaped = command[i + 1];
+		const simple = ANSI_C_ESCAPES[escaped];
+		if (simple !== undefined) {
+			bytes.push(simple);
+			i++;
+			continue;
+		}
+		if (escaped === "c" && i + 2 < command.length) {
+			const control = command.charCodeAt(i + 2);
+			bytes.push(control === 63 ? 127 : control & 31);
+			i += 2;
+			continue;
+		}
+		const octal = /[0-7]/.test(escaped);
+		const hex = escaped === "x" || escaped === "u" || escaped === "U";
+		if (octal || hex) {
+			const digitsStart = i + (octal ? 1 : 2);
+			const maxDigits = octal ? 3 : escaped === "x" ? 2 : escaped === "u" ? 4 : 8;
+			let end = digitsStart;
+			while (
+				end < command.length &&
+				end - digitsStart < maxDigits &&
+				(octal ? /[0-7]/ : /[0-9a-f]/i).test(command[end])
+			)
+				end++;
+			if (end > digitsStart) {
+				const point = Number.parseInt(command.slice(digitsStart, end), octal ? 8 : 16);
+				if (octal || escaped === "x") {
+					bytes.push(point & 255);
+				} else if (point <= 0x10ffff && (point < 0xd800 || point > 0xdfff)) {
+					bytes.push(...Buffer.from(String.fromCodePoint(point)));
+				} else {
+					// An invalid Unicode escape stays literal for conservative matching.
+					bytes.push(...Buffer.from(command.slice(i, end)));
+				}
+				i = end - 1;
+				continue;
+			}
+		}
+		// Bash preserves the backslash for unrecognized escapes.
+		bytes.push(92);
+	}
+	const decoded = Buffer.from(bytes);
+	const nul = decoded.indexOf(0);
+	return { value: decoded.subarray(0, nul < 0 ? decoded.length : nul).toString("utf8"), end: i };
 }
 
 /** A command in a conservative, flat `&&` chain. */

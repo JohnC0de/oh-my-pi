@@ -37,6 +37,39 @@ describe.skipIf(process.platform === "win32")("worktree add checkout hooks", () 
 		return { worktree, result };
 	}
 
+	for (const symlinked of [false, true]) {
+		for (const force of [false, true]) {
+			it(`rejects ${symlinked ? "symlinked" : "direct"} overlap before ${force ? "moving" : "creating"} a branch`, async () => {
+				const branch = "overlap-probe";
+				const original = (await $`git -C ${repo} rev-parse HEAD`.text()).trim();
+				if (force) {
+					await $`git -C ${repo} branch ${branch}`.quiet();
+					await $`git -C ${repo} -c user.name=Probe -c user.email=probe@example.invalid -c commit.gpgsign=false commit --allow-empty -qm second`.quiet();
+				}
+				const base = symlinked ? path.join(root, "alias") : repo;
+				if (symlinked) await fs.symlink(repo, base, "dir");
+				const destination = path.join(base, "nested", "child");
+				const result = await $`bun ${cli} worktree add ${force ? "-B" : "-b"} ${branch} ${destination} HEAD`
+					.cwd(repo)
+					.quiet()
+					.nothrow();
+				expect(result.exitCode).not.toBe(0);
+				expect(result.stderr.toString()).toContain("overlap");
+				expect(await Bun.file(path.join(repo, "local-probe.txt")).text()).toBe(
+					"untracked file to exercise clone fallback\n",
+				);
+				expect(await fs.stat(path.join(repo, "nested")).catch(() => null)).toBeNull();
+				const ref = await $`git -C ${repo} rev-parse --verify refs/heads/${branch}`.quiet().nothrow();
+				if (force) {
+					expect(ref.exitCode).toBe(0);
+					expect(ref.stdout.toString().trim()).toBe(original);
+				} else {
+					expect(ref.exitCode).not.toBe(0);
+				}
+			});
+		}
+	}
+
 	it("runs post-checkout in the new worktree after clone or plain-checkout fallback", async () => {
 		await hook('printf "%s\\n" "$PWD" "$1" "$2" "$3" > .post-checkout-ran; echo hook-output');
 		const { worktree, result } = await add("linked");

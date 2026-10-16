@@ -38,6 +38,7 @@ impl IsolationBackend for RcopyBackend {
 
 	fn start(&self, lower: &Path, merged: &Path) -> IsoResult<()> {
 		let lower = tree::canonical_existing_dir(lower, "rcopy source", IsoError::other)?;
+		tree::validate_destination(&lower, merged)?;
 		let merged = std::path::absolute(merged).unwrap_or_else(|_| merged.to_path_buf());
 		tree::prepare_destination(&merged, "rcopy", tree::remove_existing)?;
 		if is_git_worktree(&lower) {

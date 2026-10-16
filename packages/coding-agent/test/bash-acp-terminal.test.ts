@@ -7,6 +7,8 @@ import type { ClientBridge, ClientBridgeTerminalHandle } from "@oh-my-pi/pi-codi
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { encodeTerminalImage } from "@oh-my-pi/pi-coding-agent/utils/terminal-graphics";
+import * as direnvModule from "@oh-my-pi/pi-coding-agent/exec/direnv";
+import { StreamRedactor } from "@oh-my-pi/pi-coding-agent/stream/redactor";
 
 // `getShellConfig()` validates that `shellPath` exists, and `/bin/bash` does not
 // on Windows. The ACP route only forwards the path to the stubbed client
@@ -112,6 +114,72 @@ describe("BashTool ACP terminal routing", () => {
 
 		// The handle must always be released
 		expect(releaseSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("records actual client wrapping, prefixes, cwd, and terminal identity without leaking secrets", async () => {
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "trace-terminal",
+			waitForExit: async () => ({ exitCode: 0, signal: null }),
+			currentOutput: async () => ({ output: "original output", truncated: false }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
+		const session = makeSession(bridge);
+		const config = session.settings.getShellConfig();
+		spyOn(session.settings, "getShellConfig").mockReturnValue({ ...config, prefix: "command" });
+		spyOn(direnvModule, "loadDirenvEnv").mockResolvedValue({ set: {}, unset: ["TRACE_REMOVED"] });
+		const create = spyOn(bridge, "createTerminal");
+		const result = await new BashTool(session).execute("client-trace", {
+			command: `PASSWORD='synthetic alpha beta' TOKEN="synthetic gamma delta" true`,
+		});
+		const params = create.mock.calls[0]?.[0];
+		expect(params?.command).toBe(STUB_BASH);
+		expect(params?.args).toEqual([
+			"-l",
+			"-c",
+			`command unset -v TRACE_REMOVED; PASSWORD='synthetic alpha beta' TOKEN="synthetic gamma delta" true`,
+		]);
+		expect(result.details?.execution).toMatchObject({
+			rewritten: true,
+			terminalId: "trace-terminal",
+			pidStatus: "unavailable",
+			dispatch: {
+				backend: "client-terminal",
+				program: STUB_BASH,
+				cwd: session.cwd,
+				argv: ["-l", "-c", "command unset -v TRACE_REMOVED; PASSWORD=•••••• TOKEN=•••••• true"],
+			},
+		});
+		expect(result.details?.execution.pidUnavailableReason).toContain("not a PID");
+		expect(JSON.stringify(result)).not.toContain("synthetic");
+		expect(result.content.find(block => block.type === "text")?.text).toContain("original output");
+	});
+
+	it("redacts encoded known-secret arguments in client dispatch argv without changing what launches", async () => {
+		const secret = "synthetic-value-123";
+		spyOn(StreamRedactor, "load").mockResolvedValue(
+			new StreamRedactor([], [{ value: secret, prefix: secret.slice(0, 6) }]),
+		);
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "encoded-trace",
+			waitForExit: async () => ({ exitCode: 0, signal: null }),
+			currentOutput: async () => ({ output: "original output", truncated: false }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
+		const create = spyOn(bridge, "createTerminal");
+		const command = "true $'sy\\x6ethetic-value-123'";
+		const result = await new BashTool(makeSession(bridge)).execute("encoded-client-trace", { command });
+		expect(create.mock.calls[0]?.[0].args?.at(-1)).toBe(command);
+		expect(result.details?.execution).toMatchObject({
+			requestedCommand: "true ••••••",
+			executedCommand: "true ••••••",
+			dispatch: { command: "true ••••••", argv: ["-l", "-c", "true ••••••"] },
+		});
+		expect(JSON.stringify(result)).not.toContain("synthetic");
+		expect(JSON.stringify(result)).not.toContain("\\x6e");
 	});
 
 	it("extracts graphics from cumulative terminal snapshots without leaking escapes", async () => {

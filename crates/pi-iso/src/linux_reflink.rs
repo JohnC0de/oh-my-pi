@@ -99,6 +99,7 @@ mod imp {
 
 	pub fn clone_tree(lower: &Path, merged: &Path, skip: &[&std::ffi::OsStr]) -> IsoResult<()> {
 		let lower = tree::canonical_existing_dir(lower, "reflink source", IsoError::other)?;
+		tree::validate_destination(&lower, merged)?;
 		tree::prepare_destination(merged, "reflink clone", tree::remove_existing)?;
 		let result = (|| {
 			fs::create_dir(merged)

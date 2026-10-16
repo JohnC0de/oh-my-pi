@@ -1,12 +1,15 @@
 import { getAgentDir, getDotenvEnvValues, logger } from "@oh-my-pi/pi-utils";
 import { builtinCredentialSecretEntries, collectEnvSecrets, loadSecrets } from "../secrets";
 import { CREDENTIAL_PREFIX_RULES } from "../secrets/patterns";
+import { lexShellCommand } from "../tools/shell-tokenize";
+import { quotePosixArgv } from "../utils/shell-quote";
 
 const REDACTION = "••••••";
 const MIN_PLAIN_SECRET_LENGTH = 8;
 const MIN_TYPED_PREFIX_LENGTH = 6;
 const SECRET_NAME_RE = /(KEY|SECRET|TOKEN|PASSWORD|PASSWD|PASS|AUTH|CREDENTIAL|PRIVATE|OAUTH)(_|$)/i;
-const ASSIGNMENT_RE = /["']?([A-Za-z_][A-Za-z0-9_]*)["']?\s*(?:=|:)\s*(?:"([^"\s]{4,})"|'([^'\s]{4,})'|([^\s"']{4,}))/g;
+const ASSIGNMENT_RE =
+	/["']?([A-Za-z_][A-Za-z0-9_]*)["']?\s*(?:=|:)\s*((?:"(?:\\[\s\S]|[^"\\])*"|'[^']*'|\\[\s\S]|[^\s"'\\;|&<>])+)/g;
 const CONNECTION_URL_RE = /[a-z][a-z0-9+.-]*:\/\/[^/:@?#\s]*:([^/?#@\s]+)@/gi;
 
 interface PlainSecret {
@@ -65,6 +68,36 @@ export class StreamRedactor {
 		return new StreamRedactor(patterns, plainSecrets);
 	}
 
+	/** Redact shell words before rendering command metadata, including nested shell argv. */
+	redactCommand(command: string): string {
+		const redacted = lexShellCommand(command, { decodeAnsiC: true })
+			.map(token => {
+				if (token.kind !== "word") return token.raw;
+				const assignment = /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(token.value);
+				if (assignment && SECRET_NAME_RE.test(assignment[1])) return `${assignment[1]}=${REDACTION}`;
+				// ANSI-C and concatenated quotes can hide a known value behind bytes
+				// such as \x6e. Match the decoded value but replace the raw word; never
+				// put decoded credentials (or evaluated shell expansions) in metadata.
+				if (token.raw.includes("$'") && this.redactRow(token.value) !== token.value) return REDACTION;
+				// A shell's -c argument may itself contain quoted assignments. Decode
+				// that word before redacting so wrapper escaping cannot hide the value.
+				if (token.raw !== token.value) {
+					const value = this.redactCommand(token.value);
+					if (value !== token.value) return quotePosixArgv([value]);
+				}
+				return token.raw;
+			})
+			.join("");
+		return this.redactRow(redacted);
+	}
+
+	/** An argv element is one value, even when an assignment contains spaces. */
+	redactArgument(argument: string): string {
+		const assignment = /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(argument);
+		if (assignment && SECRET_NAME_RE.test(assignment[1])) return `${assignment[1]}=${REDACTION}`;
+		return this.redactCommand(argument);
+	}
+
 	/** Redact one ANSI terminal row, dropping styling whenever any sensitive span is found. */
 	redactRow(row: string): string {
 		const plain = Bun.stripANSI(row);
@@ -86,7 +119,7 @@ export class StreamRedactor {
 		let assignment: RegExpExecArray | null;
 		while ((assignment = ASSIGNMENT_RE.exec(plain)) !== null) {
 			if (!SECRET_NAME_RE.test(assignment[1])) continue;
-			const value = assignment[2] ?? assignment[3] ?? assignment[4];
+			const value = assignment[2];
 			const start = assignment.index + assignment[0].lastIndexOf(value);
 			spans.push(start, start + value.length);
 		}

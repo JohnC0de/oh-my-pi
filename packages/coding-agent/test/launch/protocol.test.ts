@@ -30,6 +30,38 @@ const baseSnapshot = {
 	detached: false,
 };
 
+describe("service dispatch protocol", () => {
+	const start: Extract<DaemonOperation, { op: "start" }> = {
+		op: "start",
+		spec: {
+			name: "web",
+			application: "/bin/sh",
+			args: ["-c", "true"],
+			cwd: "/tmp",
+			env: {},
+			pty: false,
+			restart: "no",
+			persist: false,
+			detached: false,
+		},
+	};
+
+	it("forwards final dispatch and leaves legacy broker dispatch explicitly absent", () => {
+		const dispatch = {
+			backend: "service",
+			command: "true",
+			program: "/bin/sh",
+			argv: ["-c", "true"],
+			cwd: "/tmp",
+		};
+		expect(parseDaemonRpcResult(start, { daemon: baseSnapshot, readyTimedOut: false, dispatch })).toMatchObject({
+			dispatch,
+		});
+		const legacy = parseDaemonRpcResult(start, { daemon: baseSnapshot, readyTimedOut: false });
+		expect(legacy.op === "start" && legacy.dispatch).toBeUndefined();
+	});
+});
+
 describe("launch logs protocol", () => {
 	it("decodes terminal rows without changing their bytes", () => {
 		const terminalRows = ["\x1b[0m\x1b[1;38;5;2mready", "", "界e\u0301"];

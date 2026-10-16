@@ -100,6 +100,7 @@ mod imp {
 
 	pub fn clone_tree(lower: &Path, merged: &Path, skip: &[&std::ffi::OsStr]) -> IsoResult<()> {
 		let lower = tree::canonical_existing_dir(lower, "block-clone source", IsoError::other)?;
+		tree::validate_destination(&lower, merged)?;
 		tree::prepare_destination(merged, "block clone", remove_path)?;
 		let result = (|| {
 			fs::create_dir_all(merged)

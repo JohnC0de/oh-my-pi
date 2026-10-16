@@ -4,6 +4,7 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { type PtyRunResult, PtySession } from "@oh-my-pi/pi-natives";
 import { loadXtermTerminal } from "@oh-my-pi/pi-tui/tools/terminal-output";
 import { Settings } from "../config/settings";
+import type { BashDispatch } from "../exec/bash-executor";
 import { OutputSink, type OutputSummary } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
 import { resolveOutputMaxColumns, resolveOutputSinkArtifactMaxBytes, resolveOutputSinkHeadBytes } from "./output-meta";
@@ -26,6 +27,8 @@ export async function runInteractiveBashPty(
 		env?: Record<string, string>;
 		artifactPath?: string;
 		artifactId?: string;
+		onDispatch?: (dispatch: BashDispatch) => void;
+		onStart?: (pid: number | undefined) => void;
 	},
 ): Promise<BashInteractiveResult> {
 	const settings = await Settings.init();
@@ -103,10 +106,28 @@ export async function runInteractiveBashPty(
 						}
 					},
 				);
+				// Dispatch argv explicitly so the recorded launch and the native
+				// process use the same vector rather than parallel shell shapers.
+				const lowerShell = resolvedShell.toLowerCase();
+				const shellArg =
+					lowerShell.endsWith("cmd.exe") || lowerShell.endsWith("cmd")
+						? "/c"
+						: lowerShell.includes("powershell") || lowerShell.includes("pwsh")
+							? "-Command"
+							: "-lc";
+				const argv = [shellArg, options.command];
+				options.onDispatch?.({
+					backend: "pty",
+					command: options.command,
+					program: resolvedShell,
+					argv,
+					cwd: options.cwd,
+				});
 				void session
-					.start(
+					.startArgv(
 						{
-							command: options.command,
+							application: resolvedShell,
+							args: argv,
 							cwd: options.cwd,
 							timeoutMs: options.timeoutMs,
 							// A real TERM so editors, pagers, and TUIs behave like a normal
@@ -115,7 +136,6 @@ export async function runInteractiveBashPty(
 							signal: options.signal,
 							cols,
 							rows,
-							shell: resolvedShell,
 						},
 						(err, chunk) => {
 							if (finished || err || !chunk) return;
@@ -124,6 +144,7 @@ export async function runInteractiveBashPty(
 							if (clean) sink.push(clean.replace(/\r\n?/gu, "\n"));
 							tui.requestRender();
 						},
+						(error, pid) => options.onStart?.(!error && pid > 0 ? pid : undefined),
 					)
 					.then(finalize)
 					.catch(error => {

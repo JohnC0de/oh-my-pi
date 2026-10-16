@@ -99,6 +99,7 @@ mod imp {
 
 	pub fn start(lower: &Path, merged: &Path) -> IsoResult<()> {
 		let lower = tree::canonical_existing_dir(lower, "clone source", IsoError::other)?;
+		tree::validate_destination(&lower, merged)?;
 		if let Some(parent) = merged.parent() {
 			fs::create_dir_all(parent).map_err(|err| {
 				IsoError::other(format!("unable to create parent of {}: {err}", merged.display()))
@@ -117,6 +118,7 @@ mod imp {
 
 	pub fn clone_tree(lower: &Path, merged: &Path, skip: &[&std::ffi::OsStr]) -> IsoResult<()> {
 		let lower = tree::canonical_existing_dir(lower, "clone source", IsoError::other)?;
+		tree::validate_destination(&lower, merged)?;
 		if let Some(parent) = merged.parent() {
 			fs::create_dir_all(parent).map_err(|err| {
 				IsoError::other(format!("unable to create parent of {}: {err}", merged.display()))
@@ -138,6 +140,38 @@ mod imp {
 				.map_err(|err| IsoError::other(format!("create {}: {err}", merged.display())))?;
 		}
 
+		// A directory clone cannot apply exclusions below its root.
+		if skip
+			.iter()
+			.any(|path| Path::new(path).components().count() > 1)
+		{
+			struct Copy;
+			impl tree::TreeCopy for Copy {
+				fn symlink(&self, src: &Path, dst: &Path, kind: fs::FileType) -> IsoResult<()> {
+					tree::copy_symlink(src, dst, kind)
+				}
+
+				fn file(&self, src: &Path, dst: &Path, kind: fs::FileType) -> IsoResult<()> {
+					if kind.is_file() {
+						cow::clonefile(src, dst, CLONE_NOFOLLOW)
+							.map_err(|err| clone_error(src, dst, &err))?;
+					}
+					Ok(())
+				}
+
+				fn finish_dir(&self, src: &Path, dst: &Path) -> IsoResult<()> {
+					let permissions = fs::metadata(src)
+						.map_err(|err| IsoError::other(err.to_string()))?
+						.permissions();
+					fs::set_permissions(dst, permissions).map_err(|err| IsoError::other(err.to_string()))
+				}
+			}
+			let result = tree::copy_dir_contents(&lower, merged, skip, &Copy);
+			if result.is_err() {
+				let _ = fs::remove_dir_all(merged);
+			}
+			return result;
+		}
 		let result = (|| {
 			for entry in fs::read_dir(&lower)
 				.map_err(|err| IsoError::other(format!("read_dir {}: {err}", lower.display())))?
