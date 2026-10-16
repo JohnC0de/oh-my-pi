@@ -148,6 +148,7 @@ pub struct VcsWorktreeAddOptions {
 	/// Carry the source checkout's uncommitted changes into the new worktree
 	/// (target must be the source `HEAD`).
 	pub keep_changes: Option<bool>,
+	pub include:      Option<Vec<String>>,
 }
 /// Worktree creation outcome.
 #[napi(object)]
@@ -176,6 +177,37 @@ pub struct VcsCloneStats {
 	pub total_ms:            f64,
 	pub policy_ms:           f64,
 	pub reconcile_ms:        f64,
+	pub traversal_ms:        f64,
+	pub copy_ms:             f64,
+	pub register_ms:         f64,
+	pub branch_ms:           f64,
+	pub checkout_ms:         f64,
+	pub manifest:            VcsCloneManifest,
+}
+
+#[napi(object)]
+pub struct VcsCloneManifest {
+	pub copied:   Vec<VcsClonePath>,
+	pub excluded: Vec<VcsClonePath>,
+}
+
+#[napi(object)]
+pub struct VcsClonePath {
+	pub path:            String,
+	pub files:           f64,
+	pub bytes:           f64,
+	pub counts_measured: bool,
+}
+
+impl From<pi_iso::ClonePath> for VcsClonePath {
+	fn from(value: pi_iso::ClonePath) -> Self {
+		Self {
+			path:            value.path,
+			files:           value.files as f64,
+			bytes:           value.bytes as f64,
+			counts_measured: value.counts_measured,
+		}
+	}
 }
 
 /// One attempted backend, not necessarily the backend that materialized the
@@ -218,6 +250,20 @@ impl From<pi_iso::CloneStats> for VcsCloneStats {
 			total_ms:            stats.total_ms,
 			policy_ms:           stats.policy_ms,
 			reconcile_ms:        stats.reconcile_ms,
+			traversal_ms:        stats.traversal_ms,
+			copy_ms:             stats.copy_ms,
+			register_ms:         stats.register_ms,
+			branch_ms:           stats.branch_ms,
+			checkout_ms:         stats.checkout_ms,
+			manifest:            VcsCloneManifest {
+				copied:   stats.manifest.copied.into_iter().map(Into::into).collect(),
+				excluded: stats
+					.manifest
+					.excluded
+					.into_iter()
+					.map(Into::into)
+					.collect(),
+			},
 		}
 	}
 }
@@ -977,6 +1023,7 @@ impl VcsGitRepo {
 				detach: options.detach,
 				clone,
 				keep_changes: options.keep_changes.unwrap_or(false),
+				include: options.include.unwrap_or_default(),
 			})
 			.map(|result| VcsWorktreeAddResult {
 				cloned_with:    result.cloned_with.map(to_napi_kind),

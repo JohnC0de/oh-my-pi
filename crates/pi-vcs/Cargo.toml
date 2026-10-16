@@ -13,6 +13,8 @@ workspace = true
 [dependencies]
 futures.workspace = true
 gix.workspace = true
+ignore.workspace = true
+same-file = "1.0.6"
 gix-utils = { version = "0.3.6", default-features = false }
 jj-lib.workspace = true
 pi-iso.workspace = true

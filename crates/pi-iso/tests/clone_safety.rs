@@ -164,3 +164,70 @@ fn projfs_overlap_is_rejected_before_platform_probe_or_mutation() {
 		assert!(!source.join("missing").exists());
 	}
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bind_mount_alias_rejects_overlap() {
+	if std::env::var_os("PI_ISO_BIND_CHILD").is_some() {
+		let root = PathBuf::from(std::env::var_os("PI_ISO_BIND_ROOT").unwrap());
+		let source = root.join("source");
+		let alias = root.join("alias");
+		assert!(
+			std::process::Command::new("mount")
+				.args(["--bind"])
+				.arg(&source)
+				.arg(&alias)
+				.status()
+				.unwrap()
+				.success()
+		);
+		assert!(pi_iso::validate_destination(&source, &alias.join("new/child")).is_err());
+		assert!(
+			pi_iso::backend(pi_iso::BackendKind::LinuxReflink)
+				.clone_tree(&source, &alias.join("new/child"), &[])
+				.is_err()
+		);
+		assert!(!source.join("new").exists());
+		assert_eq!(fs::read(source.join("precious")).unwrap(), b"unchanged");
+		return;
+	}
+	let available = std::process::Command::new("unshare")
+		.args(["-rm", "true"])
+		.output();
+	if !matches!(&available, Ok(output) if output.status.success()) {
+		eprintln!(
+			"SKIP bind mount: unshare -rm unavailable: {:?}",
+			available.map(|output| String::from_utf8_lossy(&output.stderr).into_owned())
+		);
+		return;
+	}
+	let fixture = Fixture::new();
+	fs::create_dir(fixture.0.join("source")).unwrap();
+	fs::create_dir(fixture.0.join("alias")).unwrap();
+	fs::write(fixture.0.join("source/precious"), b"unchanged").unwrap();
+	assert!(
+		std::process::Command::new("unshare")
+			.args(["-rm"])
+			.arg(std::env::current_exe().unwrap())
+			.args(["--exact", "bind_mount_alias_rejects_overlap", "--nocapture"])
+			.env("PI_ISO_BIND_CHILD", "1")
+			.env("PI_ISO_BIND_ROOT", &fixture.0)
+			.status()
+			.unwrap()
+			.success()
+	);
+}
+
+#[test]
+fn case_alias_rejects_overlap_when_filesystem_supports_it() {
+	let fixture = Fixture::new();
+	let source = fixture.0.join("MixedCase");
+	fs::create_dir(&source).unwrap();
+	let alias = fixture.0.join("mixedcase");
+	if !alias.exists() {
+		eprintln!("SKIP case alias: temporary filesystem is case-sensitive");
+		return;
+	}
+	assert!(pi_iso::validate_destination(&source, &alias.join("new")).is_err());
+	assert!(!source.join("new").exists());
+}

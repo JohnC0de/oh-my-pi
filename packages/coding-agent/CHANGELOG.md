@@ -8,8 +8,8 @@
 
 ### Changed
 
-- Bash results now retain redacted requested/executed command provenance and available owner, job, and process identities; rewritten worktree commands are explicitly shown instead of silently reporting the original git command.
-- `omp worktree add` reports native clone phase timings and measured copy counters; bulk-backend traversal counts are explicitly marked unavailable.
+- Bash results distinguish worktree rewrites from shell wrappers, show the executed `omp worktree add`, and record parent executable/PID and managed-job availability. Metadata redaction refreshes when secret sources change and protects assignment values containing commas or braces.
+- `omp worktree add --json` reports separate traversal, copying, registration and reconciliation timings, plus copied/excluded manifests; text output stays concise. Excluded directories are pruned without measuring private contents, and concurrent source edits are reconciled after copying. Required ignored assets can be named with `worktree.include` or `.omp/worktree-include`; `--keep-changes` retains staged, unstaged and non-ignored untracked changes.
 - Reduced CPU overhead during syntax checks and automatic edit repairs ([#15904](https://github.com/can1357/oh-my-pi/pull/15904) by [@iliaal](https://github.com/iliaal)).
 - Reduced status-line refresh overhead while subagents have long conversations ([#15874](https://github.com/can1357/oh-my-pi/pull/15874) by [@iliaal](https://github.com/iliaal)).
 - Agents now send `todo` updates alongside their next tool call instead of spending a separate model turn on them ([#15402](https://github.com/can1357/oh-my-pi/pull/15402) by [@will-bogusz](https://github.com/will-bogusz))
@@ -18,7 +18,9 @@
 
 ### Fixed
 
-- Fixed recursive worktree copies by rejecting overlapping paths before branch or filesystem changes, preserving tracked files while excluding ignored content, and cleaning owned failed clone attempts.
+- Fixed recursive worktree copies through bind mounts and filesystem aliases by checking file identities before mutation and during copying. Non-keep worktrees no longer copy untracked data just to delete it.
+- Fixed stream redaction consuming adjacent JSON fields and short benign status counts.
+- Fixed large worktree copy manifests being truncated when CLI output is piped.
 - Fixed browser `uploadFile` failing with "Not allowed" through the relay or into a Chrome on another machine, stalling behind macOS folder-privacy prompts, and breaking the tab on large drop-zone files ([#15489](https://github.com/can1357/oh-my-pi/pull/15489) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed browser `uploadFile` sending a stale copy of a file rewritten without changing its size or timestamp, failing on folders that contain a symlink loop, and deleting copies a still-open attached page could read after a repeat upload
 - Fixed plan mode (including plan-yolo) looping on `write xd://propose` forever when an extension provides a tool named `write`; the extension tool is left out of plan mode with a warning, since only the built-in `write` can submit plans ([#14030](https://github.com/can1357/oh-my-pi/issues/14030), [#14438](https://github.com/can1357/oh-my-pi/pull/14438) by [@F0Rextasy](https://github.com/F0Rextasy))

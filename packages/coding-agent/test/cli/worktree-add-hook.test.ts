@@ -70,6 +70,62 @@ describe.skipIf(process.platform === "win32")("worktree add checkout hooks", () 
 		}
 	}
 
+	it.each(["-b", "-B"])("removes a branch created by %s when policy loading fails", async flag => {
+		await fs.mkdir(path.join(repo, ".omp/worktree-include"), { recursive: true });
+		const branch = "policy-failure";
+		const destination = path.join(root, "policy-failure");
+		const result = await $`bun ${cli} worktree add ${flag} ${branch} ${destination} HEAD`.cwd(repo).quiet().nothrow();
+		expect(result.exitCode).not.toBe(0);
+		const ref = await $`git -C ${repo} rev-parse --verify refs/heads/${branch}`.quiet().nothrow();
+		expect(ref.exitCode).not.toBe(0);
+		expect(await fs.stat(destination).catch(() => null)).toBeNull();
+	});
+
+	it("restores a preexisting forced branch when policy loading fails", async () => {
+		await $`git -C ${repo} branch existing`.quiet();
+		const original = (await $`git -C ${repo} rev-parse HEAD`.text()).trim();
+		await $`git -C ${repo} -c user.name=Probe -c user.email=probe@example.invalid -c commit.gpgsign=false commit --allow-empty -qm newer`.quiet();
+		await fs.mkdir(path.join(repo, ".omp/worktree-include"), { recursive: true });
+		const result = await $`bun ${cli} worktree add -B existing ${path.join(root, "failed")} HEAD`
+			.cwd(repo)
+			.quiet()
+			.nothrow();
+		expect(result.exitCode).not.toBe(0);
+		const ref = await $`git -C ${repo} rev-parse --verify refs/heads/existing`.quiet().nothrow();
+		expect(ref.exitCode).toBe(0);
+		expect(ref.stdout.toString().trim()).toBe(original);
+	});
+
+	it("prints a bounded text summary instead of the full file manifest", async () => {
+		await Bun.write(path.join(repo, "not-for-text-output.txt"), "payload\n");
+		await $`git -C ${repo} add not-for-text-output.txt`.quiet();
+		await $`git -C ${repo} -c user.name=Probe -c user.email=probe@example.invalid -c commit.gpgsign=false commit -qm payload`.quiet();
+		const { result } = await add("text-summary");
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout.toString()).toContain("Copy summary:");
+		expect(result.stdout.toString()).not.toContain("not-for-text-output.txt");
+	});
+
+	it("flushes large JSON copy manifests before CLI exit", async () => {
+		const payload = path.join(repo, "payload");
+		await fs.mkdir(payload);
+		const names = Array.from({ length: 2048 }, (_, index) => `${index}-${"asset".repeat(32)}.txt`);
+		await Promise.all(names.map(name => Bun.write(path.join(payload, name), "")));
+		await $`git -C ${repo} add payload`.quiet();
+		await $`git -C ${repo} -c user.name=Probe -c user.email=probe@example.invalid -c commit.gpgsign=false commit -qm payload`.quiet();
+		const worktree = path.join(root, "large-manifest");
+		const result = await $`bun ${cli} worktree add --detach --json ${worktree} HEAD`.cwd(repo).quiet().nothrow();
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout.byteLength).toBeGreaterThan(256 * 1024);
+		const receipt = JSON.parse(result.stdout.toString());
+		expect(receipt.cloneStats.manifest.copied).toHaveLength(names.length);
+		expect(receipt.cloneStats.filesCopied).toBe(names.length);
+		for (const attempt of receipt.cloneAttempts) {
+			expect(attempt.stats.manifest.copied).toHaveLength(0);
+			expect(attempt.stats.manifest.excluded).toHaveLength(0);
+		}
+	});
+
 	it("runs post-checkout in the new worktree after clone or plain-checkout fallback", async () => {
 		await hook('printf "%s\\n" "$PWD" "$1" "$2" "$3" > .post-checkout-ran; echo hook-output');
 		const { worktree, result } = await add("linked");

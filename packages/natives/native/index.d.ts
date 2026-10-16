@@ -3674,11 +3674,23 @@ export interface VcsCloneAttempt {
   cleanupMs: number
 }
 
+export interface VcsCloneManifest {
+  copied: Array<VcsClonePath>
+  excluded: Array<VcsClonePath>
+}
+
 /** Clone options. */
 export interface VcsCloneOptions {
   refName?: string
   sha?: string
   timeoutMs?: number
+}
+
+export interface VcsClonePath {
+  path: string
+  files: number
+  bytes: number
+  countsMeasured: boolean
 }
 
 /** Native clone phase timings and bounded traversal counters. */
@@ -3701,6 +3713,12 @@ export interface VcsCloneStats {
   totalMs: number
   policyMs: number
   reconcileMs: number
+  traversalMs: number
+  copyMs: number
+  registerMs: number
+  branchMs: number
+  checkoutMs: number
+  manifest: VcsCloneManifest
 }
 
 /** Commit author identity. */
@@ -3867,6 +3885,7 @@ export interface VcsWorktreeAddOptions {
    * (target must be the source `HEAD`).
    */
   keepChanges?: boolean
+  include?: Array<string>
 }
 
 /** Worktree creation outcome. */

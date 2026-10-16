@@ -58,6 +58,10 @@ function isBackgroundNotice(line: string, jobId: string): boolean {
 /** Shell execution metadata used by transcript rendering. */
 export interface BashToolDetails {
 	meta?: OutputMeta;
+	execution?: {
+		executedCommand: string;
+		rewriteKind?: "worktree-add" | "wrapper" | "transform";
+	};
 	timeoutSeconds?: number;
 	requestedTimeoutSeconds?: number;
 	timeoutDisabled?: boolean;
@@ -489,6 +493,9 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 			args?: TArgs,
 		): Component {
 			const renderArgs = toBashRenderArgs(args, config);
+			if (result.details?.execution?.rewriteKind === "worktree-add") {
+				renderArgs.command = result.details.execution.executedCommand;
+			}
 			let cmdLines: string[] | undefined;
 			const isError = result.isError === true;
 			const isPartial = options.isPartial === true;
@@ -496,17 +503,23 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 			const details = result.details;
 			const isTimeout = details?.timedOut === true;
 			const header =
-				config.showHeader === false
+				config.showHeader === false && result.details?.execution?.rewriteKind !== "worktree-add"
 					? undefined
 					: renderStatusLine(
 							success
 								? {
 										iconOverride: uiTheme.styledSymbol("tool.bash", "accent"),
-										title: config.resolveTitle(args, options),
+										title:
+											result.details?.execution?.rewriteKind === "worktree-add"
+												? "git worktree add → omp worktree add"
+												: config.resolveTitle(args, options),
 									}
 								: {
 										icon: isPartial ? "pending" : isTimeout ? "warning" : "error",
-										title: config.resolveTitle(args, options),
+										title:
+											result.details?.execution?.rewriteKind === "worktree-add"
+												? "git worktree add → omp worktree add"
+												: config.resolveTitle(args, options),
 									},
 							uiTheme,
 						);
@@ -680,7 +693,11 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 			const output = stripped.text.trimEnd();
 			const expanded = renderContext?.expanded ?? options.expanded;
 			const showingFullOutput = expanded && renderContext?.isFullOutput === true;
-			const command = formatBashCommandText(toBashRenderArgs(args, config));
+			const execution = details?.execution;
+			const command =
+				execution?.rewriteKind === "worktree-add"
+					? execution.executedCommand
+					: formatBashCommandText(toBashRenderArgs(args, config));
 			const previewLines = renderContext?.previewLines ?? BASH_DEFAULT_PREVIEW_LINES;
 			const state = shellRunState(details, isError, isPartial, options.cancelled === true);
 			// Live (a running call, or a parked job still streaming): the call's clock. Settled: the
@@ -706,7 +723,15 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 				{ key: "run", tone: RUN_BOX_TONE[state] },
 			);
 			return {
-				tool: shellToolHead(config.resolveTitle(args, options), command, callIntent(args), details, !isPartial),
+				tool: shellToolHead(
+					execution?.rewriteKind === "worktree-add"
+						? "git worktree add → omp worktree add"
+						: config.resolveTitle(args, options),
+					command,
+					callIntent(args),
+					details,
+					!isPartial,
+				),
 				body: [box],
 				tone: state === "timed-out" ? "warning" : undefined,
 				preview: "children",
