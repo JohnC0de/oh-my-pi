@@ -5,6 +5,7 @@ import {
 	type DaemonSpec,
 	type DaemonSnapshot,
 } from "@oh-my-pi/pi-tui/tools/daemon";
+import type { BashDispatch } from "../exec/bash-executor";
 /**
  * Cross-process daemon broker protocol shared by the tool, client, and broker.
  */
@@ -69,7 +70,7 @@ export type DaemonOperation =
 /** Typed broker result decoded before it reaches tool code. */
 export type DaemonRpcResult =
 	| { op: "ping"; projectDir: string }
-	| { op: "start"; daemon: DaemonSnapshot; readyTimedOut: boolean }
+	| { op: "start"; daemon: DaemonSnapshot; readyTimedOut: boolean; dispatch?: BashDispatch }
 	| { op: "list"; daemons: DaemonSnapshot[] }
 	| {
 			op: "logs";
@@ -396,6 +397,7 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 				op: "start",
 				daemon: parseDaemonSnapshot(source.daemon),
 				readyTimedOut: booleanValue(source.readyTimedOut, "result.readyTimedOut"),
+				dispatch: source.dispatch === undefined ? undefined : parseServiceDispatch(source.dispatch),
 			};
 		case "list": {
 			if (!Array.isArray(source.daemons)) throw new Error("result.daemons must be an array");
@@ -440,4 +442,16 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 		case "shutdown":
 			return { op: "shutdown" };
 	}
+}
+
+function parseServiceDispatch(value: unknown): BashDispatch {
+	const source = record(value, "result.dispatch");
+	if (source.backend !== "service") throw new Error("result.dispatch.backend must be service");
+	return {
+		backend: "service",
+		command: rawString(source.command, "result.dispatch.command"),
+		program: stringValue(source.program, "result.dispatch.program"),
+		argv: stringArray(source.argv, "result.dispatch.argv"),
+		cwd: stringValue(source.cwd, "result.dispatch.cwd"),
+	};
 }

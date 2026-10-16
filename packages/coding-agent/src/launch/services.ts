@@ -12,6 +12,7 @@ import { renderTerminalOutputIsolated } from "./terminal-output-worker-client";
 import type { ToolSession } from "../tools";
 import { resolveToCwd } from "../tools/path-utils";
 import { isSharedBrowserDaemonName } from "../tools/browser/shared-daemon";
+import type { BashDispatch } from "../exec/bash-executor";
 
 import { cfgLaunchEnabled } from "../tools/settings";
 
@@ -27,6 +28,7 @@ export interface ServiceStart {
 	cwd?: string;
 	pty?: boolean;
 	ready?: ServiceReady;
+	onDispatch?: (dispatch: BashDispatch) => void;
 }
 
 const serviceStateKey = Symbol("ownedServices");
@@ -263,6 +265,7 @@ export async function startService(
 		signal,
 	);
 	if (result.op !== "start") throw new Error("Unexpected daemon start response");
+	if (result.dispatch) params.onDispatch?.(result.dispatch);
 	const launched = result.daemon;
 	// A legacy broker ignores `awaitReady` and already waited: its result is
 	// ready, terminal, or timed out, so the wait phase is skipped.

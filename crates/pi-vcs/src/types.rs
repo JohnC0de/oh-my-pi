@@ -112,7 +112,9 @@ pub struct WorktreeEntry {
 pub enum WorktreeClone {
 	/// Materialize the target tree from the object database.
 	Off,
-	/// Try every available copy-on-write tree-cloning backend.
+	/// Try every available copy-on-write tree-cloning backend. Clone tracked
+	/// paths and non-ignored untracked files; prune ignored output and nested
+	/// worktrees rather than copying their independent working trees.
 	Auto,
 	/// Try this backend first, then other available cloning backends.
 	Prefer(pi_iso::BackendKind),
@@ -126,14 +128,52 @@ pub struct WorktreeAddOptions {
 	/// Carry the source checkout's staged, unstaged, and untracked changes
 	/// into the new worktree instead of starting from a clean tree. Requires
 	/// the target ref to resolve to the source `HEAD` commit.
+	/// Ignored untracked files are excluded on both clone and checkout paths.
 	pub keep_changes: bool,
 }
 
 /// Outcome of linked-worktree creation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WorktreeAddResult {
-	pub cloned_with: Option<pi_iso::BackendKind>,
-	pub clone_error: Option<String>,
+	pub cloned_with:    Option<pi_iso::BackendKind>,
+	pub clone_error:    Option<String>,
+	/// Successful native clone only; failed attempts remain in `clone_attempts`.
+	/// Phase times are wall milliseconds; entry/byte counters require
+	/// `traversal_measured`.
+	pub clone_stats:    Option<pi_iso::CloneStats>,
+	/// Ordered backend attempts, including failures before a checkout fallback.
+	pub clone_attempts: Vec<WorktreeCloneAttempt>,
+}
+
+/// The outcome of one native worktree clone attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeCloneOutcome {
+	Succeeded,
+	Failed,
+}
+
+impl WorktreeCloneOutcome {
+	pub const fn as_str(self) -> &'static str {
+		match self {
+			Self::Succeeded => "succeeded",
+			Self::Failed => "failed",
+		}
+	}
+}
+
+/// Measured work for an attempted backend, independent of the final checkout
+/// backend.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorktreeCloneAttempt {
+	pub backend:    pi_iso::BackendKind,
+	pub outcome:    WorktreeCloneOutcome,
+	pub error:      Option<String>,
+	pub stats:      pi_iso::CloneStats,
+	/// Entire policy/clone/reconciliation attempt, excluding cleanup.
+	pub elapsed_ms: f64,
+	/// Cleanup following a failed attempt, before trying another backend or
+	/// checkout.
+	pub cleanup_ms: f64,
 }
 
 /// Commit authorship for commit creation and replay flows.

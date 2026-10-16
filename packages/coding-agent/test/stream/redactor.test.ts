@@ -53,6 +53,55 @@ describe("StreamRedactor", () => {
 		expect(redactor.redactRow("prefix API_KEY=abcd1234 suffix")).toBe("prefix API_KEY=•••••• suffix");
 	});
 
+	it("redacts an opaque assignment argv element without leaking its whitespace-delimited suffix", () => {
+		const isolated = new StreamRedactor([], []);
+		expect(isolated.redactArgument("PASSWORD=synthetic alpha beta")).toBe("PASSWORD=••••••");
+		expect(isolated.redactArgument('TOKEN=synthetic "quoted" suffix')).toBe("TOKEN=••••••");
+		expect(isolated.redactCommand("PASSWORD=synthetic harmless-command")).toBe("PASSWORD=•••••• harmless-command");
+	});
+
+	it.each([
+		"PASSWORD='synthetic alpha beta' true",
+		'TOKEN="synthetic alpha beta" true',
+		'PASSWORD="synthetic \\"alpha\\" beta" true',
+		"PASSWORD='synthetic alpha'\" beta\" true",
+		"PASSWORD=synthetic\\ alpha\\ beta true",
+	])("redacts complete secret assignment words in %s", command => {
+		const isolated = new StreamRedactor([], []);
+		expect(isolated.redactCommand(command)).toBe(`${command.startsWith("TOKEN") ? "TOKEN" : "PASSWORD"}=•••••• true`);
+		expect(isolated.redactRow(command)).not.toContain("synthetic");
+		expect(isolated.redactRow(command)).not.toContain("beta");
+	});
+
+	it("redacts assignments inside shell-escaped nested command arguments", () => {
+		const isolated = new StreamRedactor([], []);
+		const command = `/bin/sh -c 'PASSWORD='"'"'synthetic alpha beta'"'"' true'`;
+		const result = isolated.redactCommand(command);
+		expect(result).not.toContain("synthetic");
+		expect(result).not.toContain("beta");
+		expect(result).toContain("PASSWORD=••••••");
+	});
+
+	it.each([
+		{ word: "$'sy\\x6ethetic-value-123'", secret: "synthetic-value-123" },
+		{ word: "$'sy\\156thetic-value-123'", secret: "synthetic-value-123" },
+		{ word: "$'sy\\u006ethetic-value-123'", secret: "synthetic-value-123" },
+		{ word: "$'sy\\U0000006ethetic-value-123'", secret: "synthetic-value-123" },
+		{ word: "syn$'\\x74he'\"tic-value-123\"", secret: "synthetic-value-123" },
+		{ word: "$'synthetic-\\'quoted\\'-value-123'", secret: "synthetic-'quoted'-value-123" },
+		{ word: "$'synthetic-\\xc3\\xa9-value-123'", secret: "synthetic-é-value-123" },
+		{ word: "$'synthetic-\\u00e9-value-123'", secret: "synthetic-é-value-123" },
+	])("redacts the raw ANSI-C word when its decoded bytes match a known secret: $word", ({ word, secret }) => {
+		const isolated = new StreamRedactor([], [{ value: secret, prefix: secret.slice(0, 6) }]);
+		expect(isolated.redactCommand(`true ${word}`)).toBe("true ••••••");
+	});
+
+	it("does not rewrite harmless ANSI-C words or evaluate shell expansions while matching", () => {
+		const isolated = new StreamRedactor([], []);
+		const command = "true $'benign\\x20word' $'$(touch /must-not-run)'";
+		expect(isolated.redactCommand(command)).toBe(command);
+	});
+
 	it("skips an invalid user pattern while applying the remaining patterns", async () => {
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {

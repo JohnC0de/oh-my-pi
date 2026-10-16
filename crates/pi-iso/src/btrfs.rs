@@ -116,6 +116,7 @@ mod imp {
 
 	pub fn start(lower: &Path, merged: &Path) -> IsoResult<()> {
 		let lower = tree::canonical_existing_dir(lower, "btrfs snapshot source", IsoError::other)?;
+		tree::validate_destination(&lower, merged)?;
 		// `btrfs subvolume snapshot` only snapshots a subvolume root; answer
 		// that from `stat`/`statfs` instead of spawning it to find out.
 		let is_subvolume_root = fs::metadata(&lower)

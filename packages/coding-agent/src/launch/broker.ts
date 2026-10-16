@@ -7,6 +7,8 @@ import { FileLock, IpcConnection, IpcServer, Process, type PtyRunResult, PtySess
 import { isEnoent, isRecord, logger, postmortem, procmgr, sanitizeText, setProcessName } from "@oh-my-pi/pi-utils";
 import { TerminalQueryResponder } from "@oh-my-pi/pi-utils/vterm";
 import { hostHasInheritableConsole } from "../eval/py/spawn-options";
+import type { BashDispatch } from "../exec/bash-executor";
+import { StreamRedactor } from "../stream/redactor";
 import {
 	truncateHead,
 	truncateHeadBytes,
@@ -95,6 +97,7 @@ interface ManagedProcess {
 interface ManagedDaemon {
 	spec: DaemonSpec;
 	snapshot: DaemonSnapshot;
+	dispatch?: BashDispatch;
 	dir: string;
 	log?: DaemonLog;
 	process?: ManagedProcess;
@@ -117,6 +120,22 @@ interface ManagedDaemon {
 	persistedSpec?: string;
 	/** Serialized metadata last written (or recovered); a write is skipped while unchanged. */
 	persistedMeta?: string;
+}
+
+function redactServiceDispatch(
+	redactor: StreamRedactor,
+	program: string,
+	argv: readonly string[],
+	cwd: string,
+	command = quotePosixArgv([program, ...argv]),
+): BashDispatch {
+	return {
+		backend: "service",
+		command: redactor.redactCommand(command),
+		program: redactor.redactRow(program),
+		argv: argv.map(arg => (arg === command ? redactor.redactCommand(arg) : redactor.redactArgument(arg))),
+		cwd: redactor.redactRow(cwd),
+	};
 }
 
 interface BrokerLease {
@@ -780,10 +799,11 @@ class DaemonBroker {
 			readyTimedOut = !ready;
 		}
 		await record.persistQueue;
-		return { op: "start", daemon: record.snapshot, readyTimedOut };
+		return { op: "start", daemon: record.snapshot, readyTimedOut, dispatch: record.dispatch };
 	}
 
 	async #launch(record: ManagedDaemon): Promise<void> {
+		record.dispatch = undefined;
 		record.generation++;
 		const generation = record.generation;
 		record.stopRequested = false;
@@ -804,9 +824,11 @@ class DaemonBroker {
 		record.outputOffset = 0;
 		this.#persist(record);
 		try {
+			const redactor = await StreamRedactor.load(record.spec.cwd, []);
+			if (generation !== record.generation || record.stopRequested) return;
 			if (record.spec.detached) await this.#launchDetached(record, generation);
-			else if (record.spec.pty) await this.#launchPty(record, generation);
-			else this.#launchPipe(record, generation);
+			else if (record.spec.pty) await this.#launchPty(record, generation, redactor);
+			else this.#launchPipe(record, generation, redactor);
 			if (record.spec.ready?.port !== undefined) void this.#pollPort(record, generation, record.spec.ready);
 			this.#markReady(record);
 		} catch (error) {
@@ -816,7 +838,7 @@ class DaemonBroker {
 		}
 	}
 
-	async #launchPty(record: ManagedDaemon, generation: number): Promise<void> {
+	async #launchPty(record: ManagedDaemon, generation: number, redactor: StreamRedactor): Promise<void> {
 		const session = new PtySession();
 		record.pty = session;
 		const options = {
@@ -866,6 +888,7 @@ class DaemonBroker {
 		};
 		let run: Promise<PtyRunResult>;
 		if (process.platform === "win32") {
+			record.dispatch = redactServiceDispatch(redactor, record.spec.application, record.spec.args, record.spec.cwd);
 			run = session.startArgv(
 				{
 					application: record.spec.application,
@@ -879,7 +902,16 @@ class DaemonBroker {
 			const argv = [record.spec.application, ...record.spec.args];
 			const command = `exec ${quotePosixArgv(argv)}`;
 			const shell = procmgr.getShellConfig().shell;
-			run = session.start({ command, shell, ...options }, onChunk, onStart);
+			const lower = shell.toLowerCase();
+			const flag =
+				lower.endsWith("cmd.exe") || lower.endsWith("cmd")
+					? "/c"
+					: lower.includes("powershell") || lower.includes("pwsh")
+						? "-Command"
+						: "-lc";
+			const shellArgs = [flag, command];
+			record.dispatch = redactServiceDispatch(redactor, shell, shellArgs, record.spec.cwd, command);
+			run = session.startArgv({ application: shell, args: shellArgs, ...options }, onChunk, onStart);
 		}
 		void run.then(
 			async result => {
@@ -899,7 +931,8 @@ class DaemonBroker {
 		}
 	}
 
-	#launchPipe(record: ManagedDaemon, generation: number): void {
+	#launchPipe(record: ManagedDaemon, generation: number, redactor: StreamRedactor): void {
+		record.dispatch = redactServiceDispatch(redactor, record.spec.application, record.spec.args, record.spec.cwd);
 		const process = Bun.spawn([record.spec.application, ...record.spec.args], {
 			cwd: record.spec.cwd,
 			env: workerEnvFromParent(record.spec.env),

@@ -417,6 +417,20 @@ describe("bash services via proc://", () => {
 				pty: false,
 			});
 			expect(started.details?.service?.ready).toBeTrue();
+			const config = session.settings.getShellConfig();
+			expect(started.details?.execution).toMatchObject({
+				pidStatus: "available",
+				pids: [started.details?.service?.pid],
+				dispatch: {
+					backend: "service",
+					program: config.shell,
+					argv: [
+						...config.args,
+						"printf 'READY\\n'; while IFS= read -r line; do printf 'ACK:[%s]\\n' \"$line\"; done",
+					],
+					cwd,
+				},
+			});
 			expect(started.content[0]?.type === "text" ? started.content[0].text : "").toContain("READY");
 			const list = await proc.resolve(parseInternalUrl("proc://"), { session });
 			expect(list.content).toContain("echo-service [service]");

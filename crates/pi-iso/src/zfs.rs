@@ -108,6 +108,7 @@ mod imp {
 		}
 
 		let lower = tree::canonical_existing_dir(lower, "ZFS clone source", IsoError::unavailable)?;
+		tree::validate_destination(&lower, merged)?;
 		let merged = std::path::absolute(merged).unwrap_or_else(|_| merged.to_path_buf());
 		// Linux `statfs` tells a source off ZFS apart without listing every
 		// dataset to find no match.

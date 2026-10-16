@@ -22,7 +22,8 @@ use crate::{
 	error::{Error, Result},
 	types::{
 		CleanOptions, CommitAuthor, CommitOptions, DetachGitDirResult, ResetMode, RestoreOptions,
-		WorktreeAddOptions, WorktreeAddResult, WorktreeClone,
+		WorktreeAddOptions, WorktreeAddResult, WorktreeClone, WorktreeCloneAttempt,
+		WorktreeCloneOutcome,
 	},
 };
 
@@ -602,9 +603,13 @@ impl GitRepo {
 		ref_name: &str,
 		options: WorktreeAddOptions,
 	) -> Result<WorktreeAddResult> {
+		// Run before branch creation, destination cleanup, or backend fallback.
+		pi_iso::validate_destination(self.root(), path)
+			.map_err(|err| Error::backend("git worktree add", err))?;
 		let repo = self.gix()?;
 		let id = resolve_commit(&repo, ref_name)?;
-		if path.exists() && fs::read_dir(path)?.next().is_some() {
+		let destination_existed = path.exists();
+		if destination_existed && fs::read_dir(path)?.next().is_some() {
 			return Err(Error::backend(
 				"git worktree add",
 				"destination already exists and is not empty",
@@ -660,29 +665,69 @@ impl GitRepo {
 			WorktreeClone::Prefer(kind) => Some(Some(kind)),
 		};
 		let mut clone_error = None;
+		let mut clone_attempts = Vec::new();
 		if let Some(preferred) = preferred {
 			for kind in pi_iso::clone_candidates(preferred) {
-				match self.worktree_add_cloned(path, id, &head, kind, options.keep_changes) {
+				let started = std::time::Instant::now();
+				let mut stats = pi_iso::CloneStats::default();
+				let result =
+					self.worktree_add_cloned(path, id, &head, kind, options.keep_changes, &mut stats);
+				let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+				match result {
 					Ok(()) => {
-						return Ok(WorktreeAddResult { cloned_with: Some(kind), clone_error });
+						clone_attempts.push(WorktreeCloneAttempt {
+							backend: kind,
+							outcome: WorktreeCloneOutcome::Succeeded,
+							error: None,
+							stats: stats.clone(),
+							elapsed_ms,
+							cleanup_ms: 0.0,
+						});
+						return Ok(WorktreeAddResult {
+							cloned_with: Some(kind),
+							clone_error,
+							clone_stats: Some(stats),
+							clone_attempts,
+						});
 					},
 					Err(err) => {
-						clone_error = Some(err.to_string());
-						cleanup_worktree_add(path, &self.info().common_dir);
+						let error = err.to_string();
+						clone_error = Some(error.clone());
+						let cleanup_started = std::time::Instant::now();
+						cleanup_worktree_add(path, &self.info().common_dir, destination_existed);
+						clone_attempts.push(WorktreeCloneAttempt {
+							backend: kind,
+							outcome: WorktreeCloneOutcome::Failed,
+							error: Some(error),
+							stats,
+							elapsed_ms,
+							cleanup_ms: cleanup_started.elapsed().as_secs_f64() * 1000.0,
+						});
 					},
 				}
 			}
 		}
 
-		fs::create_dir_all(path)?;
-		let admin = register_worktree(path, &self.info().common_dir, &head)?;
-		let linked = Self::require(path)?;
-		let linked_repo = linked.gix()?;
-		checkout_tree(&linked, &linked_repo, id, true)?;
-		if options.keep_changes {
-			self.seed_worktree_changes(path, &admin, id)?;
+		let checkout = (|| -> Result<()> {
+			fs::create_dir_all(path)?;
+			let admin = register_worktree(path, &self.info().common_dir, &head)?;
+			let linked = Self::require(path)?;
+			let linked_repo = linked.gix()?;
+			checkout_tree(&linked, &linked_repo, id, true)?;
+			if options.keep_changes {
+				self.seed_worktree_changes(path, &admin, id)?;
+			}
+			Ok(())
+		})();
+		if let Err(source) = checkout {
+			cleanup_worktree_add(path, &self.info().common_dir, destination_existed);
+			return Err(if clone_attempts.is_empty() {
+				source
+			} else {
+				Error::WorktreeAdd { source: Box::new(source), clone_attempts }
+			});
 		}
-		Ok(WorktreeAddResult { cloned_with: None, clone_error })
+		Ok(WorktreeAddResult { cloned_with: None, clone_error, clone_stats: None, clone_attempts })
 	}
 
 	/// Replicate the source checkout's uncommitted state onto a worktree at
@@ -720,7 +765,7 @@ impl GitRepo {
 		};
 
 		for relative in dirty_tracked.iter().chain(&untracked).chain(&staged) {
-			let relative = relative.to_path_lossy();
+			let relative = worktree_path(relative.as_bstr());
 			let src = self.root().join(&relative);
 			let dst = path.join(&relative);
 			match fs::symlink_metadata(&src) {
@@ -766,6 +811,7 @@ impl GitRepo {
 		head: &str,
 		kind: pi_iso::BackendKind,
 		keep_changes: bool,
+		stats: &mut pi_iso::CloneStats,
 	) -> Result<()> {
 		let repo = self.gix()?;
 		for key in ["core.sparseCheckout", "core.splitIndex"] {
@@ -780,13 +826,41 @@ impl GitRepo {
 			return Err(Error::backend("git worktree add", "source index is missing"));
 		}
 
-		pi_iso::backend(kind)
-			.clone_tree(self.root(), path, &[OsStr::new(".git")])
-			.map_err(|err| Error::backend("git worktree add", err))?;
-		let admin = register_worktree(path, &self.info().common_dir, head)?;
-		fs::copy(&source_index, admin.join("index"))?;
+		let policy_started = std::time::Instant::now();
+		let exclusions = self.clone_exclusions();
+		stats.policy_ms = policy_started.elapsed().as_secs_f64() * 1000.0;
+		let exclusions = exclusions?;
+		let skip: Vec<&OsStr> = exclusions.iter().map(|path| path.as_os_str()).collect();
+		let policy_ms = stats.policy_ms;
+		match pi_iso::backend(kind).clone_tree_with_stats(self.root(), path, &skip) {
+			Ok(measured) => *stats = measured,
+			Err(err) => {
+				*stats = err.stats;
+				stats.policy_ms = policy_ms;
+				return Err(Error::backend("git worktree add", err.error));
+			},
+		}
+		stats.policy_ms = policy_ms;
+		let reconcile_started = std::time::Instant::now();
+		let result =
+			self.reconcile_cloned_worktree(path, id, head, keep_changes, &repo, &source_index);
+		stats.reconcile_ms = reconcile_started.elapsed().as_secs_f64() * 1000.0;
+		result
+	}
 
-		let (dirty_tracked, untracked) = collect_clone_reconciliation_paths(&repo)?;
+	fn reconcile_cloned_worktree(
+		&self,
+		path: &Path,
+		id: gix::hash::ObjectId,
+		head: &str,
+		keep_changes: bool,
+		repo: &gix::Repository,
+		source_index: &Path,
+	) -> Result<()> {
+		let admin = register_worktree(path, &self.info().common_dir, head)?;
+		fs::copy(source_index, admin.join("index"))?;
+
+		let (dirty_tracked, untracked) = collect_clone_reconciliation_paths(repo)?;
 		let linked = Self::require(path)?;
 		let linked_repo = linked.gix()?;
 		let mut current = load_index_or_empty(&linked_repo, "git worktree add")?;
@@ -796,9 +870,10 @@ impl GitRepo {
 			// (new inodes); refresh it for entries the source reports clean so
 			// dirty files still hash on the next status.
 			refresh_clean_index_stats(&mut current, path, &dirty_tracked)?;
-			return current
+			current
 				.write(INDEX_WRITE)
-				.map_err(|err| Error::backend("git worktree add", err));
+				.map_err(|err| Error::backend("git worktree add", err))?;
+			return Ok(());
 		}
 		let tree = commit_tree(&linked_repo, &id)?;
 		let mut target = linked_repo
@@ -827,7 +902,7 @@ impl GitRepo {
 		);
 
 		for relative in &delete {
-			let full = path.join(relative.to_path_lossy());
+			let full = path.join(worktree_path(relative.as_bstr()));
 			match fs::remove_file(&full) {
 				Ok(()) => prune_empty_parents(path, full.parent(), &BTreeSet::new())?,
 				Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
@@ -883,7 +958,7 @@ impl GitRepo {
 				entry.stat = written.stat;
 			} else {
 				let metadata = gix::index::fs::Metadata::from_path_no_follow(
-					&path.join(entry_path.to_path_lossy()),
+					&path.join(worktree_path(entry_path)),
 				)?;
 				entry.stat = gix::index::entry::Stat::from_fs(&metadata)
 					.map_err(|err| Error::backend("git worktree add", err))?;
@@ -891,7 +966,60 @@ impl GitRepo {
 		}
 		target
 			.write(INDEX_WRITE)
-			.map_err(|err| Error::backend("git worktree add", err))
+			.map_err(|err| Error::backend("git worktree add", err))?;
+		Ok(())
+	}
+
+	/// Clone exactly the live tracked and non-ignored untracked file set.
+	/// Ignore rules, not directory-name heuristics, express user intent: a
+	/// tracked `target/` or `node_modules/` remains present. Prune excluded
+	/// trees without descending into generated output or nested repositories.
+	fn clone_exclusions(&self) -> Result<Vec<PathBuf>> {
+		let mut files = BTreeSet::new();
+		let mut directories = BTreeSet::new();
+		let repo = self.gix()?;
+		let index = load_index_or_empty(&repo, "git worktree add")?;
+		// All index stages own their live worktree path, including unresolved
+		// conflicts whose marker contents do not match any indexed blob.
+		let tracked = index
+			.entries()
+			.iter()
+			.map(|entry| worktree_path(entry.path(&index)).into_owned());
+		let (_, untracked) = collect_clone_reconciliation_paths(&repo)?;
+		for path in tracked.chain(
+			untracked
+				.iter()
+				.map(|path| worktree_path(path.as_bstr()).into_owned()),
+		) {
+			let mut parent = path.parent();
+			while let Some(path) = parent {
+				directories.insert(path.to_path_buf());
+				parent = path.parent();
+			}
+			files.insert(path);
+		}
+		let mut excluded = vec![PathBuf::from(".git")];
+		let mut pending = vec![PathBuf::new()];
+		while let Some(relative) = pending.pop() {
+			for entry in fs::read_dir(self.root().join(&relative))? {
+				let entry = entry?;
+				let child = relative.join(entry.file_name());
+				if child == Path::new(".git") {
+					continue;
+				}
+				let kind = entry.file_type()?;
+				if kind.is_dir() {
+					if directories.contains(&child) {
+						pending.push(child);
+					} else {
+						excluded.push(child);
+					}
+				} else if !files.contains(&child) {
+					excluded.push(child);
+				}
+			}
+		}
+		Ok(excluded)
 	}
 
 	/// Resolve the executable hook `name` as git's `find_hook` does: under
@@ -1712,16 +1840,15 @@ fn set_config_file(path: &Path, key: &str, value: &str) -> Result<()> {
 	Ok(())
 }
 
-/// Paths whose entry differs between `left` and `right` (blob id or mode), or
-/// that exist on only one side.
+/// Paths whose entry differs between `left` and `right` (blob id, mode, or
+/// stage), or that exist on only one side.
 fn index_diff_paths(left: &gix::index::File, right: &gix::index::File) -> BTreeSet<BString> {
 	let mut paths = BTreeSet::new();
 	for entry in left.entries() {
 		let entry_path = entry.path(left);
-		if right
-			.entry_by_path(entry_path)
-			.is_none_or(|other| other.id != entry.id || other.mode != entry.mode)
-		{
+		if right.entry_by_path(entry_path).is_none_or(|other| {
+			other.id != entry.id || other.mode != entry.mode || other.stage() != entry.stage()
+		}) {
 			paths.insert(entry_path.to_owned());
 		}
 	}
@@ -1734,19 +1861,20 @@ fn index_diff_paths(left: &gix::index::File, right: &gix::index::File) -> BTreeS
 	paths
 }
 
-/// Point the stat cache of every index entry outside `dirty` at the file now
-/// under `root`, so entries whose content matches the index read as clean.
+/// Point the stat cache of clean stage-zero entries at the files now under
+/// `root`. Unmerged stages describe alternative blobs, not the live
+/// conflict-marker file.
 fn refresh_clean_index_stats(
 	index: &mut gix::index::File,
 	root: &Path,
 	dirty: &BTreeSet<BString>,
 ) -> Result<()> {
 	for (entry, entry_path) in index.entries_mut_with_paths() {
-		if dirty.contains(entry_path) {
+		if entry.stage() != gix::index::entry::Stage::Unconflicted || dirty.contains(entry_path) {
 			continue;
 		}
 		let Ok(metadata) =
-			gix::index::fs::Metadata::from_path_no_follow(&root.join(entry_path.to_path_lossy()))
+			gix::index::fs::Metadata::from_path_no_follow(&root.join(worktree_path(entry_path)))
 		else {
 			continue;
 		};
@@ -1806,6 +1934,21 @@ fn collect_clone_reconciliation_paths(
 	Ok((dirty_tracked, untracked))
 }
 
+/// Git stores path bytes, not display strings. Unix filesystems preserve those
+/// bytes; only platforms requiring Unicode paths use the lossy display
+/// fallback.
+fn worktree_path(path: &gix::bstr::BStr) -> Cow<'_, Path> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::ffi::OsStrExt;
+		Cow::Borrowed(Path::new(OsStr::from_bytes(path)))
+	}
+	#[cfg(not(unix))]
+	{
+		path.to_path_lossy()
+	}
+}
+
 fn git_metadata_path(path: &Path) -> Cow<'_, str> {
 	let display = path.to_string_lossy();
 	if cfg!(windows) {
@@ -1817,19 +1960,57 @@ fn git_metadata_path(path: &Path) -> Cow<'_, str> {
 
 fn register_worktree(path: &Path, common: &Path, head: &str) -> Result<PathBuf> {
 	fs::create_dir_all(path)?;
-	let name = worktree_admin_name(common, path);
-	let admin = common.join("worktrees").join(name);
-	fs::create_dir_all(&admin)?;
-	fs::write(path.join(".git"), format!("gitdir: {}\n", git_metadata_path(&admin)))?;
-	fs::write(admin.join("gitdir"), format!("{}\n", git_metadata_path(&path.join(".git"))))?;
-	fs::write(admin.join("commondir"), "../..\n")?;
-	fs::write(admin.join("HEAD"), format!("{head}\n"))?;
+	let worktrees = common.join("worktrees");
+	fs::create_dir_all(&worktrees)?;
+	// Claim a new directory atomically, so failure cleanup can never remove a
+	// concurrently registered worktree that happened to choose the same name.
+	let admin = loop {
+		let candidate = worktrees.join(worktree_admin_name(common, path));
+		match fs::create_dir(&candidate) {
+			Ok(()) => break candidate,
+			Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+			Err(err) => return Err(err.into()),
+		}
+	};
+	let mut pointer_created = false;
+	let registration = (|| -> Result<()> {
+		fs::write(admin.join("gitdir"), format!("{}\n", git_metadata_path(&path.join(".git"))))?;
+		fs::write(admin.join("commondir"), "../..\n")?;
+		fs::write(admin.join("HEAD"), format!("{head}\n"))?;
+		let mut pointer = fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(path.join(".git"))?;
+		pointer_created = true;
+		std::io::Write::write_all(
+			&mut pointer,
+			format!("gitdir: {}\n", git_metadata_path(&admin)).as_bytes(),
+		)?;
+		Ok(())
+	})();
+	if let Err(error) = registration {
+		if pointer_created {
+			let _ = fs::remove_file(path.join(".git"));
+		}
+		let _ = fs::remove_dir_all(&admin);
+		return Err(error);
+	}
 	Ok(admin)
 }
 
-fn cleanup_worktree_add(path: &Path, common: &Path) {
+fn cleanup_worktree_add(path: &Path, common: &Path, preserve_root: bool) {
 	let admin = registered_admin(&path.join(".git")).ok().flatten();
-	let _ = fs::remove_dir_all(path);
+	if preserve_root {
+		// The caller verified this existing directory was empty before writing.
+		// Keep the directory itself, including its permissions and ownership.
+		if let Ok(entries) = fs::read_dir(path) {
+			for entry in entries.flatten() {
+				let _ = remove_existing(&entry.path());
+			}
+		}
+	} else {
+		let _ = fs::remove_dir_all(path);
+	}
 	if let Some(admin) = admin.filter(|admin| admin.starts_with(common.join("worktrees"))) {
 		let _ = fs::remove_dir_all(admin);
 	}
@@ -1908,7 +2089,7 @@ fn worktree_admin_name(common: &Path, path: &Path) -> String {
 		.unwrap_or("worktree");
 	let mut name = base.to_owned();
 	let mut n = 1;
-	while common.join("worktrees").join(&name).exists() {
+	while fs::symlink_metadata(common.join("worktrees").join(&name)).is_ok() {
 		name = format!("{base}{n}");
 		n += 1;
 	}
@@ -2814,6 +2995,29 @@ mod tests {
 	}
 
 	#[test]
+	fn partial_registration_failure_removes_only_owned_admin_files() {
+		let (_temp, repo) = fixture();
+		let destination = tempfile::tempdir().unwrap();
+		let linked = destination.path().join("linked");
+		fs::create_dir_all(linked.join(".git")).unwrap();
+		fs::write(linked.join(".git/precious"), b"not ours").unwrap();
+		let existing_admin = repo.info().common_dir.join("worktrees/existing");
+		fs::create_dir_all(&existing_admin).unwrap();
+		fs::write(existing_admin.join("precious"), b"also not ours").unwrap();
+		let new_admin = repo.info().common_dir.join("worktrees/linked");
+		assert!(register_worktree(&linked, &repo.info().common_dir, "ref: refs/heads/main").is_err());
+		assert!(!new_admin.exists(), "failed registration must not leave its admin directory");
+		assert_eq!(fs::read(linked.join(".git/precious")).unwrap(), b"not ours");
+		assert_eq!(fs::read(existing_admin.join("precious")).unwrap(), b"also not ours");
+		fs::remove_dir_all(linked.join(".git")).unwrap();
+		let admin =
+			register_worktree(&linked, &repo.info().common_dir, "ref: refs/heads/main").unwrap();
+		assert_eq!(admin, new_admin, "retry must reuse the cleaned registration name");
+		cleanup_worktree_add(&linked, &repo.info().common_dir, false);
+		assert!(existing_admin.join("precious").exists());
+	}
+
+	#[test]
 	fn worktree_registration_paths_are_accepted_by_git() {
 		let (temp, repo) = fixture();
 		let linked_dir = tempfile::tempdir().unwrap();
@@ -2892,16 +3096,102 @@ mod tests {
 			.unwrap();
 		assert!(status.next().is_none());
 
-		if result.cloned_with.is_some() {
-			assert_eq!(fs::read_to_string(linked.join("build/out.txt")).unwrap(), "ignored\n");
-		} else {
-			assert!(!linked.join("build/out.txt").exists());
+		assert!(!linked.join("build/out.txt").exists());
+		if result.cloned_with.is_none() {
 			assert!(
 				result.clone_error.is_some() || pi_iso::clone_candidates(None).is_empty(),
 				"a failed clone attempt must surface its reason"
 			);
 		}
 		let _ = repo.worktree_remove(&linked, true);
+	}
+
+	#[test]
+	fn overlapping_worktree_targets_fail_before_mutating_source_or_refs() {
+		let (temp, repo) = fixture();
+		let before = git(temp.path(), &["show-ref"]);
+		let original = fs::read(temp.path().join("a")).unwrap();
+		let mut targets = vec![temp.path().to_path_buf(), temp.path().join("new/child")];
+		#[cfg(unix)]
+		{
+			let alias = temp.path().join("alias");
+			std::os::unix::fs::symlink(temp.path(), &alias).unwrap();
+			targets.push(alias.join("missing/child"));
+		}
+		for target in targets {
+			let error = repo
+				.worktree_add(&target, "must-not-exist", WorktreeAddOptions {
+					detach:       false,
+					clone:        WorktreeClone::Auto,
+					keep_changes: false,
+				})
+				.unwrap_err();
+			assert!(error.to_string().contains("overlap"));
+			assert_eq!(fs::read(temp.path().join("a")).unwrap(), original);
+			assert_eq!(git(temp.path(), &["show-ref"]), before);
+			assert!(!temp.path().join("new").exists());
+			assert!(!temp.path().join("missing").exists());
+		}
+	}
+
+	#[test]
+	fn nonempty_worktree_destination_is_not_cleaned_up() {
+		let (temp, repo) = fixture();
+		let destination = tempfile::tempdir().unwrap();
+		fs::write(destination.path().join("user-data"), "precious\n").unwrap();
+		assert!(
+			repo
+				.worktree_add(destination.path(), "HEAD", WorktreeAddOptions {
+					detach:       true,
+					clone:        WorktreeClone::Auto,
+					keep_changes: false,
+				})
+				.is_err()
+		);
+		assert_eq!(fs::read_to_string(destination.path().join("user-data")).unwrap(), "precious\n");
+		assert!(temp.path().join(".git").is_dir());
+	}
+
+	#[test]
+	fn clone_policy_preserves_tracked_generated_names_and_unignored_files() {
+		let (temp, repo) = fixture();
+		fs::create_dir_all(temp.path().join("target")).unwrap();
+		fs::create_dir_all(temp.path().join("nested/cache")).unwrap();
+		fs::write(temp.path().join("target/required"), "tracked\n").unwrap();
+		git(temp.path(), &["add", "target/required"]);
+		fs::write(temp.path().join(".gitignore"), "target/\nnested/cache/\n").unwrap();
+		git(temp.path(), &["add", ".gitignore"]);
+		git(temp.path(), &["commit", "-qm", "tracked generated-looking file"]);
+		fs::write(temp.path().join("target/bulky"), "ignored\n").unwrap();
+		fs::write(temp.path().join("nested/cache/bulky"), "ignored\n").unwrap();
+		fs::write(temp.path().join("nested/notes"), "untracked\n").unwrap();
+		git(temp.path(), &["worktree", "add", "--detach", "nested/linked", "HEAD"]);
+		let excluded = repo.clone_exclusions().unwrap();
+		assert!(excluded.contains(&PathBuf::from("target/bulky")));
+		assert!(excluded.contains(&PathBuf::from("nested/cache")));
+		assert!(excluded.contains(&PathBuf::from("nested/linked")));
+		assert!(!excluded.contains(&PathBuf::from("target")));
+		let destination = tempfile::tempdir().unwrap();
+		let linked = destination.path().join("linked");
+		let clone_works = clone_works_on(destination.path());
+		let result = repo
+			.worktree_add(&linked, "HEAD", WorktreeAddOptions {
+				detach:       true,
+				clone:        WorktreeClone::Auto,
+				keep_changes: true,
+			})
+			.unwrap();
+		if clone_works {
+			assert!(result.cloned_with.is_some(), "{:?}", result.clone_error);
+			assert!(result.clone_stats.is_some());
+		}
+		assert_eq!(fs::read_to_string(linked.join("target/required")).unwrap(), "tracked\n");
+		assert_eq!(fs::read_to_string(linked.join("nested/notes")).unwrap(), "untracked\n");
+		assert!(!linked.join("target/bulky").exists());
+		assert!(!linked.join("nested/cache").exists());
+		assert!(!linked.join("nested/linked").exists());
+		assert_eq!(fs::read_to_string(temp.path().join("target/bulky")).unwrap(), "ignored\n");
+		repo.worktree_remove(&linked, true).unwrap();
 	}
 
 	/// Whether any host-available clone backend can actually clone a tree
@@ -2922,6 +3212,273 @@ mod tests {
 		let _ = fs::remove_dir_all(&source);
 		let _ = fs::remove_dir_all(&target);
 		works
+	}
+
+	#[test]
+	fn failed_clone_attempts_survive_plain_checkout_fallback() {
+		let (temp, repo) = fixture();
+		// Reject cloning before traversal, independent of host filesystem
+		// support.
+		git(temp.path(), &["config", "core.splitIndex", "true"]);
+		let destination = tempfile::tempdir().unwrap();
+		let linked = destination.path().join("linked");
+		let candidates = pi_iso::clone_candidates(None);
+		let result = repo
+			.worktree_add(&linked, "HEAD", WorktreeAddOptions {
+				detach:       true,
+				clone:        WorktreeClone::Auto,
+				keep_changes: false,
+			})
+			.unwrap();
+		assert!(result.cloned_with.is_none());
+		assert!(result.clone_stats.is_none());
+		assert_eq!(result.clone_attempts.len(), candidates.len());
+		for (attempt, backend) in result.clone_attempts.iter().zip(candidates) {
+			assert_eq!(attempt.backend, backend);
+			assert_eq!(attempt.outcome, WorktreeCloneOutcome::Failed);
+			assert!(attempt.error.as_ref().unwrap().contains("core.splitIndex"));
+			assert!(!attempt.stats.traversal_measured);
+			assert_eq!(attempt.stats.entries_visited, 0);
+			assert_eq!(attempt.stats.files_copied, 0);
+			assert!(attempt.elapsed_ms.is_finite() && attempt.elapsed_ms >= 0.0);
+			assert!(attempt.cleanup_ms.is_finite() && attempt.cleanup_ms >= 0.0);
+		}
+		assert_eq!(git(&linked, &["status", "--porcelain"]), "");
+		assert_eq!(fs::read(linked.join("a")).unwrap(), fs::read(temp.path().join("a")).unwrap());
+		repo.worktree_remove(&linked, true).unwrap();
+	}
+
+	#[test]
+	fn terminal_checkout_error_retains_failed_clone_attempts() {
+		let (temp, repo) = fixture();
+		git(temp.path(), &["config", "core.splitIndex", "true"]);
+		// Leave the commit resolvable, but make checkout of its tree fail.
+		let tree = git(temp.path(), &["rev-parse", "HEAD^{tree}"]);
+		let tree_path = repo
+			.info()
+			.common_dir
+			.join("objects")
+			.join(&tree[..2])
+			.join(&tree[2..]);
+		let tree_bytes = fs::read(&tree_path).unwrap();
+		let listed_before = git(temp.path(), &["worktree", "list", "--porcelain"]);
+		fs::remove_file(&tree_path).unwrap();
+		let destination = tempfile::tempdir().unwrap();
+		let linked = destination.path().join("linked");
+		let candidates = pi_iso::clone_candidates(None);
+		let error = repo
+			.worktree_add(&linked, "HEAD", WorktreeAddOptions {
+				detach:       true,
+				clone:        WorktreeClone::Auto,
+				keep_changes: false,
+			})
+			.unwrap_err();
+		let kind = error.kind();
+		let message = error.to_string();
+		match error {
+			Error::WorktreeAdd { source, clone_attempts } => {
+				assert_eq!(kind, source.kind());
+				assert_eq!(message, source.to_string());
+				assert_eq!(clone_attempts.len(), candidates.len());
+				assert!(!clone_attempts.is_empty());
+				for attempt in clone_attempts {
+					assert_eq!(attempt.outcome, WorktreeCloneOutcome::Failed);
+					assert!(attempt.error.as_ref().unwrap().contains("core.splitIndex"));
+					assert!(!attempt.stats.traversal_measured);
+					assert!(attempt.elapsed_ms.is_finite() && attempt.elapsed_ms >= 0.0);
+					assert!(attempt.cleanup_ms.is_finite() && attempt.cleanup_ms >= 0.0);
+				}
+			},
+			_ => assert!(candidates.is_empty(), "lost clone attempts: {message}"),
+		}
+		assert_eq!(fs::read(temp.path().join("a")).unwrap(), b"one\n");
+		assert!(!linked.exists(), "terminal failure must remove the newly created destination");
+		assert!(!repo.info().common_dir.join("worktrees/linked").exists());
+		assert_eq!(git(temp.path(), &["worktree", "list", "--porcelain"]), listed_before);
+		fs::write(&tree_path, tree_bytes).unwrap();
+		repo
+			.worktree_add(&linked, "HEAD", WorktreeAddOptions {
+				detach:       true,
+				clone:        WorktreeClone::Auto,
+				keep_changes: false,
+			})
+			.unwrap();
+		assert_eq!(fs::read(linked.join("a")).unwrap(), b"one\n");
+		repo.worktree_remove(&linked, true).unwrap();
+	}
+
+	#[test]
+	fn failed_checkout_preserves_preexisting_empty_destination() {
+		let (temp, repo) = fixture();
+		let tree = git(temp.path(), &["rev-parse", "HEAD^{tree}"]);
+		let tree_path = repo
+			.info()
+			.common_dir
+			.join("objects")
+			.join(&tree[..2])
+			.join(&tree[2..]);
+		fs::remove_file(tree_path).unwrap();
+		let destination = tempfile::tempdir().unwrap();
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			fs::set_permissions(destination.path(), fs::Permissions::from_mode(0o750)).unwrap();
+		}
+		assert!(
+			repo
+				.worktree_add(destination.path(), "HEAD", WorktreeAddOptions {
+					detach:       true,
+					clone:        WorktreeClone::Off,
+					keep_changes: false,
+				},)
+				.is_err()
+		);
+		assert!(destination.path().is_dir());
+		assert!(fs::read_dir(destination.path()).unwrap().next().is_none());
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			assert_eq!(
+				fs::metadata(destination.path())
+					.unwrap()
+					.permissions()
+					.mode()
+					& 0o777,
+				0o750
+			);
+		}
+		assert!(
+			fs::read_dir(repo.info().common_dir.join("worktrees"))
+				.unwrap()
+				.next()
+				.is_none()
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn keep_changes_preserves_non_utf8_tracked_and_untracked_paths() {
+		use std::os::unix::ffi::OsStrExt;
+
+		for clone in [WorktreeClone::Auto, WorktreeClone::Off] {
+			let (temp, repo) = fixture();
+			let tracked = Path::new(OsStr::from_bytes(b"tracked-\xff"));
+			let directory = Path::new(OsStr::from_bytes(b"parent-\xfe"));
+			let nested = directory.join(OsStr::from_bytes(b"file-\xff"));
+			let untracked = directory.join(OsStr::from_bytes(b"new-\xfd"));
+			let ignored = Path::new(OsStr::from_bytes(b"ignored-\xff"));
+			fs::create_dir(temp.path().join(directory)).unwrap();
+			fs::write(temp.path().join(tracked), b"tracked").unwrap();
+			fs::write(temp.path().join(&nested), b"nested").unwrap();
+			fs::write(temp.path().join(".gitignore"), "ignored-*/\n").unwrap();
+			git(temp.path(), &["add", "-A"]);
+			git(temp.path(), &["commit", "-qm", "raw byte paths"]);
+			fs::write(temp.path().join(tracked), b"dirty tracked").unwrap();
+			fs::write(temp.path().join(&untracked), b"untracked").unwrap();
+			fs::create_dir(temp.path().join(ignored)).unwrap();
+			fs::write(temp.path().join(ignored).join("output"), b"ignored").unwrap();
+			let exclusions = repo.clone_exclusions().unwrap();
+			assert!(!exclusions.contains(&tracked.to_path_buf()));
+			assert!(!exclusions.contains(&directory.to_path_buf()));
+			assert!(!exclusions.contains(&nested));
+			assert!(!exclusions.contains(&untracked));
+			assert!(exclusions.contains(&ignored.to_path_buf()));
+			let destination = tempfile::tempdir().unwrap();
+			let native_available = clone == WorktreeClone::Auto && clone_works_on(destination.path());
+			let linked = destination.path().join("linked");
+			let result = repo
+				.worktree_add(&linked, "HEAD", WorktreeAddOptions {
+					detach: true,
+					clone,
+					keep_changes: true,
+				})
+				.unwrap();
+			if native_available {
+				assert!(
+					result.cloned_with.is_some(),
+					"must exercise native clone: {:?}",
+					result.clone_error
+				);
+			}
+			assert_eq!(fs::read(linked.join(tracked)).unwrap(), b"dirty tracked");
+			assert_eq!(fs::read(linked.join(&nested)).unwrap(), b"nested");
+			assert_eq!(fs::read(linked.join(&untracked)).unwrap(), b"untracked");
+			assert!(!linked.join(ignored).exists());
+			assert_eq!(
+				git(&linked, &["ls-files", "--stage"]),
+				git(temp.path(), &["ls-files", "--stage"])
+			);
+			assert_eq!(
+				git(&linked, &["status", "--porcelain"]),
+				git(temp.path(), &["status", "--porcelain"])
+			);
+			assert_eq!(fs::read(temp.path().join(tracked)).unwrap(), b"dirty tracked");
+			assert_eq!(fs::read(temp.path().join(&untracked)).unwrap(), b"untracked");
+			repo.worktree_remove(&linked, true).unwrap();
+		}
+	}
+
+	#[test]
+	fn keep_changes_preserves_unmerged_stages_and_edited_conflict_markers() {
+		for clone in [WorktreeClone::Auto, WorktreeClone::Off] {
+			let (temp, repo) = fixture();
+			fs::write(temp.path().join(".gitignore"), "a\nbuild/\n").unwrap();
+			git(temp.path(), &["add", ".gitignore"]);
+			git(temp.path(), &["commit", "-qm", "ignore generated output"]);
+			git(temp.path(), &["checkout", "-qb", "other"]);
+			fs::write(temp.path().join("a"), "theirs\n").unwrap();
+			git(temp.path(), &["add", "a"]);
+			git(temp.path(), &["commit", "-qm", "other change"]);
+			git(temp.path(), &["checkout", "-q", "main"]);
+			fs::write(temp.path().join("a"), "ours\n").unwrap();
+			git(temp.path(), &["add", "a"]);
+			git(temp.path(), &["commit", "-qm", "main change"]);
+			let merge = Command::new("git")
+				.arg("-C")
+				.arg(temp.path())
+				.args(["merge", "--no-edit", "other"])
+				.output()
+				.unwrap();
+			assert!(!merge.status.success());
+			let conflict = b"<<<<<<< HEAD\nours manually edited\n=======\ntheirs\n>>>>>>> other\n";
+			fs::write(temp.path().join("a"), conflict).unwrap();
+			fs::create_dir(temp.path().join("build")).unwrap();
+			fs::write(temp.path().join("build/output"), b"ignored").unwrap();
+			let stages = git(temp.path(), &["ls-files", "--stage"]);
+			assert_eq!(
+				git(temp.path(), &["ls-files", "--unmerged"])
+					.lines()
+					.count(),
+				3
+			);
+			let index_before = fs::read(repo.info().git_dir.join("index")).unwrap();
+			let exclusions = repo.clone_exclusions().unwrap();
+			assert!(!exclusions.contains(&PathBuf::from("a")));
+			assert!(exclusions.contains(&PathBuf::from("build")));
+			let destination = tempfile::tempdir().unwrap();
+			let clone_works = clone == WorktreeClone::Auto && clone_works_on(destination.path());
+			let linked = destination.path().join("linked");
+			let result = repo
+				.worktree_add(&linked, "HEAD", WorktreeAddOptions {
+					detach: true,
+					clone,
+					keep_changes: true,
+				})
+				.unwrap();
+			if clone_works {
+				assert!(result.cloned_with.is_some(), "{:?}", result.clone_error);
+				let attempt = result.clone_attempts.last().unwrap();
+				assert_eq!(attempt.outcome, WorktreeCloneOutcome::Succeeded);
+				assert_eq!(Some(attempt.backend), result.cloned_with);
+				assert_eq!(Some(&attempt.stats), result.clone_stats.as_ref());
+			}
+			assert_eq!(fs::read(linked.join("a")).unwrap(), conflict);
+			assert_eq!(git(&linked, &["ls-files", "--stage"]), stages);
+			assert!(!linked.join("build").exists());
+			assert_eq!(fs::read(temp.path().join("a")).unwrap(), conflict);
+			assert_eq!(fs::read(repo.info().git_dir.join("index")).unwrap(), index_before);
+			repo.worktree_remove(&linked, true).unwrap();
+		}
 	}
 
 	#[test]
@@ -2988,11 +3545,7 @@ mod tests {
 			assert_eq!(fs::read_to_string(linked.join("a")).unwrap(), "staged then edited\n");
 			assert!(!linked.join("b").exists());
 			assert_eq!(fs::read_to_string(linked.join("new/dir/untracked")).unwrap(), "untracked\n");
-			assert_eq!(
-				linked.join("build/out.txt").exists(),
-				result.cloned_with.is_some(),
-				"ignored files ride along only with a clone"
-			);
+			assert!(!linked.join("build/out.txt").exists(), "ignored output must not ride along");
 			assert_eq!(
 				git(&linked, &["status", "--porcelain"]),
 				git(temp.path(), &["status", "--porcelain"]),

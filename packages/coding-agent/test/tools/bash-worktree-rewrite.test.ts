@@ -33,4 +33,16 @@ describe("rewriteGitWorktreeAdd", () => {
 			"bun '/opt/omp cli.ts' worktree add -- 'path with spaces'",
 		);
 	});
+
+	it("preserves separators and quoted apostrophes across multiple rewrites", () => {
+		expect(rewriteGitWorktreeAdd(`git worktree add "it's here"; git status && git worktree add ../other`, OMP)).toBe(
+			`bun '/opt/omp cli.ts' worktree add -- 'it'\\''s here'; git status && bun '/opt/omp cli.ts' worktree add -- ../other`,
+		);
+	});
+
+	it("does not replace ordinary executables or git text in arguments", () => {
+		for (const command of ["omp --harness gate", "printf 'git worktree add ../wt'", "git status && echo done"]) {
+			expect(rewriteGitWorktreeAdd(command, OMP)).toBe(command);
+		}
+	});
 });

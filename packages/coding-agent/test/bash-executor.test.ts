@@ -7,6 +7,7 @@ import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config
 import type { ShellMinimizerSettings } from "@oh-my-pi/pi-coding-agent/exec/settings";
 import {
 	applyDirenvPreflight,
+	type BashDispatch,
 	buildMinimizerOptions,
 	executeBash,
 	isPersistentShellCdCommand,
@@ -143,6 +144,30 @@ describe("executeBash", () => {
 		["echo cd child", false],
 	] as const)("classifies persistent-shell cd routing for %j", (command, expected) => {
 		expect(isPersistentShellCdCommand(command)).toBe(expected);
+	});
+
+	it("reports the exact final embedded input after prefix and direnv rewriting", async () => {
+		const config = Settings.instance.getShellConfig();
+		vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({ ...config, prefix: "command" });
+		vi.spyOn(direnvModule, "loadDirenvEnv").mockResolvedValue({ set: {}, unset: ["TRACE_REMOVED"] });
+		const launches: BashDispatch[] = [];
+		const run = vi.spyOn(piNatives.Shell.prototype, "run");
+		const result = await executeBash("printf traced", {
+			cwd: tempDir,
+			onDispatch: dispatch => launches.push(dispatch),
+		});
+		expect(result.output).toBe("traced");
+		expect(launches).toEqual([
+			{
+				backend: "embedded",
+				command: "unset -v TRACE_REMOVED; command printf traced",
+				program: null,
+				argv: null,
+				cwd: tempDir,
+			},
+		]);
+		expect(run.mock.calls[0]?.[0].command).toBe(launches[0]?.command);
+		expect(run.mock.calls[0]?.[0].cwd).toBe(launches[0]?.cwd);
 	});
 	it("returns non-zero exit codes without cancellation", async () => {
 		const result = await executeBash("exit 7", { cwd: tempDir, timeout: 5000 });
@@ -543,6 +568,7 @@ exit 64
 			env: {
 				PATH: Bun.env.PATH ?? "",
 				HOME: shellDir,
+				XDG_CONFIG_HOME: path.join(shellDir, ".config"),
 			},
 			prefix: undefined,
 		});
@@ -594,6 +620,8 @@ exit 64
 		});
 
 		const rawChunks: string[] = [];
+		const launches: BashDispatch[] = [];
+		const pids: number[] = [];
 		try {
 			const result = await executeBash(
 				"pi_pty_alias; [ -t 1 ] && printf ' is-tty'; printf ' \\033[31mred\\033[0m'",
@@ -603,6 +631,8 @@ exit 64
 					sessionKey: "zsh-pty",
 					useUserShell: true,
 					pty: { cols: 80, rows: 24, onChunk: chunk => rawChunks.push(chunk) },
+					onDispatch: dispatch => launches.push(dispatch),
+					onStart: probe => pids.push(...probe()),
 				},
 			);
 
@@ -615,6 +645,13 @@ exit 64
 			// renderer callback for vterm replay.
 			expect(result.output).not.toContain("\u001b[31m");
 			expect(rawChunks.join("")).toContain("\u001b[31mred\u001b[0m");
+			expect(launches).toHaveLength(1);
+			expect(launches[0]?.backend).toBe("pty");
+			expect(launches[0]?.program).toBe(zshPath);
+			expect(launches[0]?.cwd).toBe(tempDir);
+			expect(launches[0]?.argv?.at(-1)).toBe(launches[0]?.command);
+			expect(pids.length).toBeGreaterThan(0);
+			expect(pids.every(pid => pid > 0)).toBe(true);
 		} finally {
 			removeSyncWithRetries(shellDir);
 		}

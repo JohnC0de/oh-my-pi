@@ -1,12 +1,14 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { PsScope } from "@oh-my-pi/pi-tui/apps/ps-data";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { PtySession } from "@oh-my-pi/pi-natives";
 import { collectScope } from "../../src/cli/ps-data";
 import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
 import { createDaemonBrokerClient } from "../../src/launch/client";
 import { DAEMON_IDLE_GRACE_ENV, DAEMON_PROJECT_DIR_ENV, DAEMON_RUNTIME_DIR_ENV } from "../../src/launch/protocol";
+import { StreamRedactor } from "../../src/stream/redactor";
 
 function startBroker(projectDir: string, runtimeDir: string): { listening: Promise<boolean>; finished: Promise<void> } {
 	const previousProjectDir = process.env[DAEMON_PROJECT_DIR_ENV];
@@ -27,6 +29,67 @@ function startBroker(projectDir: string, runtimeDir: string): { listening: Promi
 }
 
 describe("daemon metadata writes", () => {
+	it.each([false, true])("returns redacted final service dispatch across the broker protocol (pty: %s)", async pty => {
+		using temp = TempDir.createSync("@omp-service-dispatch-");
+		const projectDir = path.join(temp.path(), "project");
+		const runtimeDir = path.join(temp.path(), "runtime");
+		await fs.mkdir(projectDir);
+		// Keep host secrets and dotenv-derived path prefixes out of this dispatch
+		// contract fixture; assignment redaction itself remains real.
+		const loadRedactor = vi.spyOn(StreamRedactor, "load").mockResolvedValue(new StreamRedactor([], []));
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const broker = startBroker(projectDir, runtimeDir);
+		const startArgv = vi.spyOn(PtySession.prototype, "startArgv");
+		try {
+			await broker.listening;
+			const args = ["-e", "process.stdout.write('ok')", "PASSWORD=synthetic alpha beta"];
+			const result = await client.request({
+				op: "start",
+				spec: {
+					name: "trace",
+					application: process.execPath,
+					args,
+					env: {},
+					cwd: projectDir,
+					pty,
+					restart: "no",
+					persist: false,
+					detached: false,
+				},
+			});
+			if (result.op !== "start") throw new Error("Unexpected service response");
+			const dispatch = result.dispatch;
+			if (!dispatch || dispatch.program === null || dispatch.argv === null) {
+				throw new Error("Expected a service dispatch with program and argv");
+			}
+			expect(result.daemon.pid).toBeGreaterThan(0);
+			expect(dispatch.backend).toBe("service");
+			expect(dispatch.cwd).toBe(projectDir);
+			expect(JSON.stringify(dispatch)).not.toContain("synthetic");
+			expect(JSON.stringify(dispatch)).not.toContain("beta");
+			if (!pty || process.platform === "win32") {
+				expect(dispatch.program).toBe(process.execPath);
+				expect(dispatch.argv).toEqual([...args.slice(0, 2), "PASSWORD=••••••"]);
+				if (pty) expect(startArgv.mock.calls[0]?.[0].application).toBe(dispatch.program);
+			} else {
+				const launched = startArgv.mock.calls[0]?.[0];
+				expect(dispatch.program).toBe(launched?.application);
+				expect(dispatch.argv[0]).toBe("-lc");
+				expect(launched?.args[1]).toContain("PASSWORD=synthetic alpha beta");
+				expect(dispatch.command).toContain("PASSWORD=••••••");
+			}
+			const exit = await client.request({ op: "wait", name: "trace", for: "exit", timeoutMs: 5_000 });
+			if (exit.op !== "wait") throw new Error("Unexpected wait response");
+			expect(exit.daemon.exitCode).toBe(0);
+		} finally {
+			startArgv.mockRestore();
+			await client.request({ op: "shutdown" });
+			client.close();
+			await broker.finished;
+			loadRedactor.mockRestore();
+		}
+	});
+
 	it("does not rewrite settled history on subscriber changes or broker restart", async () => {
 		using tempDir = TempDir.createSync("@omp-broker-metadata-");
 		const projectDir = path.join(tempDir.path(), "project");

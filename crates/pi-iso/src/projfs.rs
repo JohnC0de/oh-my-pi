@@ -47,6 +47,7 @@ impl IsolationBackend for ProjfsBackend {
 	}
 
 	fn start(&self, lower: &Path, merged: &Path) -> IsoResult<()> {
+		crate::tree::validate_destination(lower, merged)?;
 		#[cfg(windows)]
 		{
 			imp::start(&lower.to_string_lossy(), &merged.to_string_lossy())
@@ -347,8 +348,9 @@ mod imp {
 	}
 
 	pub fn start(lower_root: &str, projection_root: &str) -> IsoResult<()> {
-		let api = Arc::new(ProjfsApi::load().map_err(unavailable_error)?);
+		crate::tree::validate_destination(Path::new(lower_root), Path::new(projection_root))?;
 		let lower_root_path = resolve_existing_dir(lower_root)?;
+		let api = Arc::new(ProjfsApi::load().map_err(unavailable_error)?);
 		let projection_root_path = resolve_projection_root(projection_root)?;
 		let projection_key = normalize_session_key(&projection_root_path);
 

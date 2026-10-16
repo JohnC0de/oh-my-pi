@@ -35,6 +35,15 @@ import {
 	type ShellMinimizerSettings,
 } from "./settings";
 
+/** Exact input at a backend launch boundary; null argv means an in-process shell. */
+export interface BashDispatch {
+	backend: "embedded" | "pty" | "client-terminal" | "service";
+	command: string;
+	program: string | null;
+	argv: readonly string[] | null;
+	cwd: string;
+}
+
 export interface BashExecutorOptions {
 	cwd?: string;
 	/** Milliseconds before aborting the command; 0 disables the executor deadline. */
@@ -67,11 +76,12 @@ export interface BashExecutorOptions {
 	 */
 	filesystem?: ShellFilesystem;
 	/**
-	 * Invoked once the embedded shell starts the command, with a probe of the
-	 * live pids it spawned (empty once the run ends). Not called on the
-	 * user-shell paths.
+	 * Receives a live PID probe when the backend starts. Embedded shell builtins
+	 * have no child PID; native PTYs report their child through the start callback.
 	 */
 	onStart?: (pids: () => readonly number[]) => void;
+	/** Called with the final backend input, after all command transformations. */
+	onDispatch?: (dispatch: BashDispatch) => void;
 	/** Artifact path/id for full output storage */
 	artifactPath?: string;
 	artifactId?: string;
@@ -472,12 +482,23 @@ async function executeUserShellPty(run: {
 	sink: OutputSink;
 	graphics: TerminalGraphicsDecoder;
 	dump: (notice?: string) => Promise<OutputSummary & { images?: ImageContent[] }>;
+	onDispatch?: BashExecutorOptions["onDispatch"];
+	onStart?: BashExecutorOptions["onStart"];
 }): Promise<BashResult> {
 	const session = new PtySession();
+	const argv = [...ensureInteractiveShellArgs(run.shell, run.args), run.command];
+	run.onDispatch?.({
+		backend: "pty",
+		command: run.command,
+		program: run.shell,
+		argv,
+		cwd: run.cwd ?? process.cwd(),
+	});
+	let pid: number | undefined;
 	const result = await session.startArgv(
 		{
 			application: run.shell,
-			args: [...ensureInteractiveShellArgs(run.shell, run.args), run.command],
+			args: argv,
 			cwd: run.cwd,
 			env: run.env,
 			timeoutMs: run.timeoutMs,
@@ -493,7 +514,12 @@ async function executeUserShellPty(run: {
 			const clean = run.graphics.push(chunk);
 			if (clean) run.sink.push(clean.replace(/\r\n?/gu, "\n"));
 		},
+		(error, spawnedPid) => {
+			if (!error && spawnedPid > 0) pid = spawnedPid;
+			run.onStart?.(() => (pid === undefined ? [] : [pid]));
+		},
 	);
+	pid = undefined;
 	if (result.timedOut) {
 		return {
 			exitCode: undefined,
@@ -640,6 +666,8 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				sink,
 				graphics,
 				dump,
+				onDispatch: options?.onDispatch,
+				onStart: options?.onStart,
 			});
 		} finally {
 			await sink.dispose();
@@ -722,6 +750,13 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	let resetSession = false;
 
 	try {
+		options?.onDispatch?.({
+			backend: "embedded",
+			command: finalCommand,
+			program: null,
+			argv: null,
+			cwd: commandCwd ?? process.cwd(),
+		});
 		const runPromise = executionShell.run(
 			{
 				command: finalCommand,

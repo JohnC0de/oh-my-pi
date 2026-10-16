@@ -2,11 +2,15 @@ import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { Shell } from "@oh-my-pi/pi-natives";
+import * as direnvModule from "@oh-my-pi/pi-coding-agent/exec/direnv";
+import { StreamRedactor } from "@oh-my-pi/pi-coding-agent/stream/redactor";
+import { ToolResultBuilder } from "@oh-my-pi/pi-coding-agent/tools/tool-result";
 import { getThemeByName } from "@oh-my-pi/pi-tui/theme";
 import { bashToolRenderer } from "@oh-my-pi/pi-tui/tools/bash";
 
@@ -14,7 +18,7 @@ afterEach(() => {
 	mock.restore();
 });
 
-function makeSession(): ToolSession {
+function makeSession(overrides: Readonly<Record<string, unknown>> = {}): ToolSession {
 	return {
 		cwd: "/tmp",
 		hasUI: false,
@@ -29,12 +33,190 @@ function makeSession(): ToolSession {
 			"astEdit.enabled": false,
 			"grep.enabled": false,
 			"glob.enabled": false,
+			...overrides,
 		}),
 		getClientBridge: () => undefined,
 	} as unknown as ToolSession;
 }
 
 describe("BashTool execution results", () => {
+	it("retains managed job identity after a foreground job settles", async () => {
+		const session = makeSession({ "bash.autoBackground.enabled": true });
+		session.asyncJobManager = new AsyncJobManager({ retentionMs: 0 });
+		const result = await new BashTool(session).execute("trace-job", { command: "printf managed" });
+		expect(result.details?.execution.jobId).toBeString();
+		expect(result.details?.execution.executedCommand).toBe("printf managed");
+	});
+
+	it("records final dispatch for explicitly requested background jobs", async () => {
+		const session = makeSession({ "async.enabled": true });
+		const manager = new AsyncJobManager({ retentionMs: 60_000 });
+		session.asyncJobManager = manager;
+		const updates: unknown[] = [];
+		try {
+			const result = await new BashTool(session).execute(
+				"explicit-background-trace",
+				{ command: "printf explicit-background", async: true },
+				undefined,
+				update => updates.push(update),
+			);
+			const jobId = result.details?.execution.jobId;
+			if (!jobId) throw new Error("Expected the background job identity");
+			const job = manager.getJob(jobId);
+			if (!job) throw new Error("Expected the registered background job");
+			await job.promise;
+			expect(updates).toContainEqual(
+				expect.objectContaining({
+					details: expect.objectContaining({
+						execution: expect.objectContaining({
+							jobId,
+							dispatch: expect.objectContaining({ backend: "embedded", command: "printf explicit-background" }),
+						}),
+					}),
+				}),
+			);
+		} finally {
+			await manager.dispose();
+		}
+	});
+
+	it("preserves unchanged command output and owner identity in execution metadata", async () => {
+		const session = makeSession();
+		session.getSessionId = () => "trace-session";
+		session.getAgentId = () => "trace-agent";
+		const result = await new BashTool(session).execute("trace-call", { command: "printf trace-output" });
+		expect(result.details?.execution).toMatchObject({
+			requestedCommand: "printf trace-output",
+			executedCommand: "printf trace-output",
+			rewritten: false,
+			ownerSessionId: "trace-session",
+			ownerAgentId: "trace-agent",
+		});
+		expect(result.content.find(item => item.type === "text")?.text).not.toContain("[Command rewritten]");
+	});
+
+	it("surfaces the redacted requested and executed rewrite without changing dispatch", async () => {
+		const session = makeSession({ "worktree.clone": true });
+		const realRun = Shell.prototype.run;
+		let dispatched = "";
+		spyOn(Shell.prototype, "run").mockImplementation(function (this: Shell, options, onChunk) {
+			dispatched = options.command;
+			return realRun.call(this, { ...options, command: "printf rewritten-output" }, onChunk);
+		});
+		const command = "git worktree add 'path with spaces' && echo TOKEN=hidden-value";
+		const result = await new BashTool(session).execute("trace-rewrite", { command });
+		expect(dispatched).toContain("worktree add -- 'path with spaces'");
+		expect(dispatched).not.toStartWith("git ");
+		expect(result.details?.execution.rewritten).toBe(true);
+		expect(result.details?.execution.requestedCommand).toContain("git worktree add");
+		expect(result.details?.execution.executedCommand).toContain("worktree add --");
+		const text = result.content.find(item => item.type === "text")?.text ?? "";
+		expect(text).toContain("[Command rewritten]");
+		expect(text).toContain("rewritten-output");
+		expect(text).not.toContain("hidden-value");
+		expect(JSON.stringify(result.details?.execution)).not.toContain("hidden-value");
+	});
+
+	it.each(["'synthetic alpha beta'", '"synthetic alpha beta"'])(
+		"keeps quoted secret values out of rewritten output and all execution metadata: %s",
+		async value => {
+			const command = `cd /tmp && PASSWORD=${value} TOKEN=${value} true`;
+			const result = await new BashTool(makeSession()).execute("quoted-trace", { command });
+			const rendered = JSON.stringify(result);
+			expect(rendered).not.toContain("synthetic");
+			expect(rendered).not.toContain("alpha");
+			expect(rendered).not.toContain("beta");
+			expect(result.details?.execution.requestedCommand).toContain("PASSWORD=••••••");
+			expect(result.details?.execution.dispatch?.command).toContain("TOKEN=••••••");
+		},
+	);
+
+	it.each([
+		"$'sy\\x6ethetic-value-123'",
+		"$'sy\\156thetic-value-123'",
+		"$'sy\\u006ethetic-value-123'",
+		"syn$'\\x74he'\"tic-value-123\"",
+	])("redacts known ANSI-C encoded arguments in requested and dispatched metadata: %s", async word => {
+		const secret = "synthetic-value-123";
+		spyOn(StreamRedactor, "load").mockResolvedValue(
+			new StreamRedactor([], [{ value: secret, prefix: secret.slice(0, 6) }]),
+		);
+		const run = spyOn(Shell.prototype, "run");
+		const result = await new BashTool(makeSession()).execute("ansi-c-trace", {
+			command: `cd /tmp && true ${word}`,
+		});
+		expect(run.mock.calls[0]?.[0].command).toBe(`true ${word}`);
+		expect(result.details?.execution).toMatchObject({
+			requestedCommand: "cd /tmp && true ••••••",
+			executedCommand: "true ••••••",
+			dispatch: { command: "true ••••••" },
+		});
+		const text = result.content.find(block => block.type === "text")?.text ?? "";
+		expect(text).toContain("Executed: true ••••••");
+		expect(JSON.stringify(result)).not.toContain(word);
+		expect(JSON.stringify(result)).not.toContain(secret);
+	});
+
+	it.each([false, true])("loads metadata secrets from effective cwd (leading cd: %s)", async leadingCd => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "trace-cwd-"));
+		const synthetic = "effective-cwd-only-value";
+		const load = spyOn(StreamRedactor, "load").mockResolvedValue(
+			new StreamRedactor([], [{ value: synthetic, prefix: synthetic.slice(0, 6) }]),
+		);
+		try {
+			const command = `true ${synthetic}`;
+			const result = await new BashTool(makeSession()).execute(
+				"cwd-trace",
+				leadingCd ? { command: `cd '${cwd}' && ${command}` } : { command, cwd },
+			);
+			expect(load).toHaveBeenCalledWith(cwd, []);
+			expect(JSON.stringify(result.details?.execution)).not.toContain(synthetic);
+			expect(result.details?.execution.dispatch?.cwd).toBe(cwd);
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("captures the final embedded dispatch after shell prefix and direnv unsets", async () => {
+		const session = makeSession({ "bash.direnv": "auto" });
+		const shell = session.settings.getShellConfig();
+		spyOn(Settings, "init").mockResolvedValue(session.settings);
+		spyOn(Settings.prototype, "getShellConfig").mockReturnValue({ ...shell, prefix: "command" });
+		spyOn(direnvModule, "loadDirenvEnv").mockResolvedValue({ set: {}, unset: ["TRACE_REMOVED"] });
+		const realRun = Shell.prototype.run;
+		let dispatched: { command: string; cwd?: string | null } | undefined;
+		spyOn(Shell.prototype, "run").mockImplementation(function (this: Shell, options, onChunk) {
+			dispatched = options;
+			return realRun.call(this, options, onChunk);
+		});
+		const result = await new BashTool(session).execute("final-trace", { command: "printf final-output" });
+		if (!dispatched || dispatched.cwd == null) throw new Error("Expected shell dispatch with an explicit cwd");
+		expect(dispatched.command).toBe("unset -v TRACE_REMOVED; command printf final-output");
+		expect(result.details?.execution.dispatch).toEqual({
+			backend: "embedded",
+			command: dispatched.command,
+			program: null,
+			argv: null,
+			cwd: dispatched.cwd,
+		});
+		expect(result.details?.execution.executedCommand).toBe(dispatched.command);
+		expect(result.details?.execution.rewritten).toBe(true);
+	});
+
+	it("preserves the first text, secondary texts, and images when adding a rewrite notice", async () => {
+		const image = { type: "image" as const, mimeType: "image/png", data: "synthetic-image" };
+		const first = { type: "text" as const, text: "first output" };
+		const second = { type: "text" as const, text: "secondary output" };
+		const content = [image, first, second, image];
+		spyOn(ToolResultBuilder.prototype, "done").mockReturnValue({ content, details: {} });
+		const result = await new BashTool(makeSession()).execute("preserve-trace", { command: "cd /tmp && true" });
+		expect(result.content[0]).toBe(image);
+		expect(result.content[1]).toEqual({ type: "text", text: expect.stringContaining("\n\nfirst output") });
+		expect(result.content.slice(2)).toEqual([second, image]);
+		expect(content).toEqual([image, first, second, image]);
+		expect(first.text).toBe("first output");
+	});
+
 	it.each([
 		{ wallTimeMs: 0, noticeCount: 1 },
 		{ wallTimeMs: 1000, noticeCount: 2 },

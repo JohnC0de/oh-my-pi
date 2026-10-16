@@ -93,6 +93,15 @@ pub enum Error {
 		message: String,
 	},
 
+	/// Plain checkout failed after native clone attempts; retain their resource
+	/// evidence.
+	#[error("{source}")]
+	WorktreeAdd {
+		#[source]
+		source:         Box<Error>,
+		clone_attempts: Vec<crate::types::WorktreeCloneAttempt>,
+	},
+
 	/// The operation was canceled via its interrupt flag.
 	#[error("operation canceled")]
 	Canceled,
@@ -145,6 +154,7 @@ impl Error {
 			Self::Canceled => "Canceled",
 			Self::Unsupported { .. } => "Unsupported",
 			Self::OutputTooLarge { .. } => "OutputTooLarge",
+			Self::WorktreeAdd { source, .. } => source.kind(),
 		}
 	}
 }

@@ -18,6 +18,37 @@ describe("lexShellCommand", () => {
 			"1",
 		]);
 	});
+
+	it("keeps ANSI-C decoding opt-in and preserves raw spelling", () => {
+		const command = "echo $'a\\x20b'";
+		expect(
+			lexShellCommand(command)
+				.filter(token => token.kind === "word")
+				.map(token => token.value),
+		).toEqual(["echo", "$a\\x20b"]);
+		const tokens = lexShellCommand(command, { decodeAnsiC: true });
+		expect(tokens.map(token => token.raw).join("")).toBe(command);
+		expect(tokens.filter(token => token.kind === "word").map(token => token.value)).toEqual(["echo", "a b"]);
+	});
+
+	it.each([
+		{ word: "$'alpha\\' beta'", value: "alpha' beta" },
+		{ word: "$'\\101\\x42\\u03bb\\U0001f642'", value: "ABλ\u{1f642}" },
+		{ word: "$'\\xc3\\xa9'", value: "é" },
+		{ word: "head$'\\x2d'\"tail\"", value: "head-tail" },
+		{ word: "$'a\\n\\t\\e\\\\b'", value: "a\n\t\x1b\\b" },
+		{ word: "$'$(not a program)'", value: "$(not a program)" },
+		{ word: "\"literal $'\\x41'\"", value: "literal $'\\x41'" },
+	])("decodes ANSI-C words without splitting escaped quotes or evaluating expressions: $word", ({ word, value }) => {
+		const command = `true ${word} tail`;
+		const tokens = lexShellCommand(command, { decodeAnsiC: true });
+		expect(tokens.map(token => token.raw).join("")).toBe(command);
+		expect(tokens.filter(token => token.kind === "word")).toEqual([
+			{ kind: "word", raw: "true", value: "true" },
+			{ kind: "word", raw: word, value },
+			{ kind: "word", raw: "tail", value: "tail" },
+		]);
+	});
 });
 
 describe("extractLeadingCdTarget", () => {

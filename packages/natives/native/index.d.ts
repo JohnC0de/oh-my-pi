@@ -3659,11 +3659,48 @@ export interface VcsCleanOptions {
   paths?: Array<string>
 }
 
+/**
+ * One attempted backend, not necessarily the backend that materialized the
+ * worktree.
+ */
+export interface VcsCloneAttempt {
+  backend: IsoBackendKind
+  /** `succeeded` or `failed`. */
+  outcome: string
+  error?: string
+  stats: VcsCloneStats
+  /** Entire policy/clone/reconciliation attempt, excluding cleanup. */
+  elapsedMs: number
+  cleanupMs: number
+}
+
 /** Clone options. */
 export interface VcsCloneOptions {
   refName?: string
   sha?: string
   timeoutMs?: number
+}
+
+/** Native clone phase timings and bounded traversal counters. */
+export interface VcsCloneStats {
+  /**
+   * False when traversal never began or a bulk backend did not enumerate
+   * entries.
+   */
+  traversalMeasured: boolean
+  entriesVisited: number
+  directoriesCreated: number
+  filesCopied: number
+  bytesCopied: number
+  symlinksCopied: number
+  entriesSkipped: number
+  /**
+   * Native clone wall time only; policy/reconciliation and cleanup are
+   * separate.
+   */
+  totalMs: number
+  policyMs: number
+  reconcileMs: number
 }
 
 /** Commit author identity. */
@@ -3836,6 +3873,9 @@ export interface VcsWorktreeAddOptions {
 export interface VcsWorktreeAddResult {
   clonedWith?: IsoBackendKind
   cloneError?: string
+  cloneStats?: VcsCloneStats
+  /** Ordered attempts, including failures before a plain checkout fallback. */
+  cloneAttempts: Array<VcsCloneAttempt>
 }
 
 /** One worktree listing row. */

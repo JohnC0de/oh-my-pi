@@ -22,7 +22,20 @@ use crate::{
 /// a machine-readable `code` (the [`pi_vcs::Error::kind`] discriminant), and
 /// the CLI result fields (`exitCode`/`stdout`/`stderr`; non-CLI failures
 /// mirror the message into `stderr` and synthesize `exitCode: 1`).
+/// Worktree failures after clone attempts also carry `cloneAttempts`.
 fn rich_error(env: Env, err: pi_vcs::Error) -> napi::Error {
+	let (err, clone_attempts) = match err {
+		pi_vcs::Error::WorktreeAdd { source, clone_attempts } => (
+			*source,
+			Some(
+				clone_attempts
+					.into_iter()
+					.map(VcsCloneAttempt::from)
+					.collect::<Vec<_>>(),
+			),
+		),
+		err => (err, None),
+	};
 	let message = err.to_string();
 	let kind = err.kind();
 	let (exit_code, stdout, stderr) = match err {
@@ -36,6 +49,9 @@ fn rich_error(env: Env, err: pi_vcs::Error) -> napi::Error {
 		object.set_named_property("exitCode", exit_code)?;
 		object.set_named_property("stdout", stdout.as_str())?;
 		object.set_named_property("stderr", stderr.as_str())?;
+		if let Some(attempts) = clone_attempts {
+			object.set_named_property("cloneAttempts", attempts)?;
+		}
 		Ok(napi::Error::from(object.to_unknown()))
 	})();
 	built.unwrap_or_else(|_| napi::Error::from_reason(message))
@@ -136,8 +152,74 @@ pub struct VcsWorktreeAddOptions {
 /// Worktree creation outcome.
 #[napi(object)]
 pub struct VcsWorktreeAddResult {
-	pub cloned_with: Option<IsoBackendKind>,
-	pub clone_error: Option<String>,
+	pub cloned_with:    Option<IsoBackendKind>,
+	pub clone_error:    Option<String>,
+	pub clone_stats:    Option<VcsCloneStats>,
+	/// Ordered attempts, including failures before a plain checkout fallback.
+	pub clone_attempts: Vec<VcsCloneAttempt>,
+}
+
+/// Native clone phase timings and bounded traversal counters.
+#[napi(object)]
+pub struct VcsCloneStats {
+	/// False when traversal never began or a bulk backend did not enumerate
+	/// entries.
+	pub traversal_measured:  bool,
+	pub entries_visited:     f64,
+	pub directories_created: f64,
+	pub files_copied:        f64,
+	pub bytes_copied:        f64,
+	pub symlinks_copied:     f64,
+	pub entries_skipped:     f64,
+	/// Native clone wall time only; policy/reconciliation and cleanup are
+	/// separate.
+	pub total_ms:            f64,
+	pub policy_ms:           f64,
+	pub reconcile_ms:        f64,
+}
+
+/// One attempted backend, not necessarily the backend that materialized the
+/// worktree.
+#[napi(object)]
+pub struct VcsCloneAttempt {
+	pub backend:    IsoBackendKind,
+	/// `succeeded` or `failed`.
+	pub outcome:    String,
+	pub error:      Option<String>,
+	pub stats:      VcsCloneStats,
+	/// Entire policy/clone/reconciliation attempt, excluding cleanup.
+	pub elapsed_ms: f64,
+	pub cleanup_ms: f64,
+}
+
+impl From<core::WorktreeCloneAttempt> for VcsCloneAttempt {
+	fn from(attempt: core::WorktreeCloneAttempt) -> Self {
+		Self {
+			backend:    to_napi_kind(attempt.backend),
+			outcome:    attempt.outcome.as_str().to_owned(),
+			error:      attempt.error,
+			stats:      attempt.stats.into(),
+			elapsed_ms: attempt.elapsed_ms,
+			cleanup_ms: attempt.cleanup_ms,
+		}
+	}
+}
+
+impl From<pi_iso::CloneStats> for VcsCloneStats {
+	fn from(stats: pi_iso::CloneStats) -> Self {
+		Self {
+			traversal_measured:  stats.traversal_measured,
+			entries_visited:     stats.entries_visited as f64,
+			directories_created: stats.directories_created as f64,
+			files_copied:        stats.files_copied as f64,
+			bytes_copied:        stats.bytes_copied as f64,
+			symlinks_copied:     stats.symlinks_copied as f64,
+			entries_skipped:     stats.entries_skipped as f64,
+			total_ms:            stats.total_ms,
+			policy_ms:           stats.policy_ms,
+			reconcile_ms:        stats.reconcile_ms,
+		}
+	}
 }
 /// Commit author identity.
 #[napi(object)]
@@ -897,8 +979,10 @@ impl VcsGitRepo {
 				keep_changes: options.keep_changes.unwrap_or(false),
 			})
 			.map(|result| VcsWorktreeAddResult {
-				cloned_with: result.cloned_with.map(to_napi_kind),
-				clone_error: result.clone_error,
+				cloned_with:    result.cloned_with.map(to_napi_kind),
+				clone_error:    result.clone_error,
+				clone_stats:    result.clone_stats.map(Into::into),
+				clone_attempts: result.clone_attempts.into_iter().map(Into::into).collect(),
 			})
 		})
 	}

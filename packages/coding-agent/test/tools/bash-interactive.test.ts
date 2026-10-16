@@ -3,6 +3,8 @@ import * as fs from "node:fs";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { runInteractiveBashPty } from "@oh-my-pi/pi-coding-agent/tools/bash-interactive";
+import type { BashDispatch } from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
+import { PtySession } from "@oh-my-pi/pi-natives";
 import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import { initTheme, type Theme, theme } from "@oh-my-pi/pi-tui/theme";
 import { TUI } from "@oh-my-pi/pi-tui";
@@ -95,6 +97,34 @@ describe("runInteractiveBashPty", () => {
 			expect(output).not.toContain("shell-gpg-tty");
 		},
 	);
+
+	it.skipIf(ptyUnavailable)("reports the exact PTY argv and the spawned PID", async () => {
+		const launches: BashDispatch[] = [];
+		const pids: Array<number | undefined> = [];
+		const start = vi.spyOn(PtySession.prototype, "startArgv");
+		const result = await runInteractiveBashPty(headlessUi(), {
+			command: "printf '%s' $$",
+			cwd: tempDir.path(),
+			onDispatch: launch => launches.push(launch),
+			onStart: pid => pids.push(pid),
+		});
+		expect(launches).toEqual([
+			{
+				backend: "pty",
+				command: "printf '%s' $$",
+				program: "/bin/bash",
+				argv: ["-lc", "printf '%s' $$"],
+				cwd: tempDir.path(),
+			},
+		]);
+		expect(start.mock.calls[0]?.[0]).toMatchObject({
+			application: launches[0]?.program,
+			args: launches[0]?.argv,
+			cwd: launches[0]?.cwd,
+		});
+		expect(pids).toEqual([Number(result.output.trim())]);
+		expect(pids[0]).toBeGreaterThan(0);
+	});
 
 	it.skipIf(ptyUnavailable)("lets direnv values win over the terminal defaults and the dropped guards", async () => {
 		const output = await probe({
