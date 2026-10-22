@@ -116,6 +116,12 @@ interface PageQueryElement {
 const MAX_RESULT_NODES = 10;
 const MAX_HTML_LENGTH = 300;
 
+/** Compile on first audit: each evaluator embeds the full axe-core source, so building them at import parses ~0.5 MB per evaluator in every session. */
+function lazyEvaluator(params: string[], body: string): () => (...args: unknown[]) => unknown {
+	let evaluator: ((...args: unknown[]) => unknown) | undefined;
+	return () => (evaluator ??= buildEvaluator(params, body));
+}
+
 function buildEvaluator(params: string[], body: string): (...args: unknown[]) => unknown {
 	return new Function(
 		...params,
@@ -141,7 +147,7 @@ ${body}`,
 	) as unknown as (...args: unknown[]) => unknown;
 }
 
-const evaluatePartial = buildEvaluator(
+const evaluatePartial = lazyEvaluator(
 	["request"],
 	`const options = { resultTypes: ["violations", "incomplete", "passes"], iframes: false };
 if (request.rules.length > 0) options.runOnly = { type: "rule", values: request.rules };
@@ -164,7 +170,7 @@ const frameContexts = agentAxe.utils.getFrameContexts(context).map(entry => entr
 return agentAxe.runPartial(context, options).then(partial => ({ partial, frameContexts }));`,
 );
 
-const evaluateFinish = buildEvaluator(
+const evaluateFinish = lazyEvaluator(
 	["partials", "request"],
 	`const options = { resultTypes: ["violations", "incomplete", "passes"], iframes: false };
 if (request.rules.length > 0) options.runOnly = { type: "rule", values: request.rules };
@@ -172,7 +178,7 @@ else if (request.tags.length > 0) options.runOnly = { type: "tag", values: reque
 return agentAxe.finishRun(partials, options);`,
 );
 
-const evaluateStandalone = buildEvaluator(
+const evaluateStandalone = lazyEvaluator(
 	["request"],
 	`const options = { resultTypes: ["violations", "incomplete", "passes"] };
 if (request.rules.length > 0) options.runOnly = { type: "rule", values: request.rules };
@@ -272,7 +278,7 @@ export async function runA11yAudit(page: Page, options: BrowserA11yOptions = {})
 			partials.push(false);
 			continue;
 		}
-		const evaluated = (await task.frame.evaluate(evaluatePartial as never, {
+		const evaluated = (await task.frame.evaluate(evaluatePartial() as never, {
 			tags: request.tags,
 			rules: request.rules,
 			selector: task.selector,
@@ -288,14 +294,14 @@ export async function runA11yAudit(page: Page, options: BrowserA11yOptions = {})
 		}
 		for (let index = children.length - 1; index >= 0; index -= 1) tasks.push(children[index]!);
 	}
-	const raw = (await page.evaluate(evaluateFinish as never, partials, request)) as AxeResults;
+	const raw = (await page.evaluate(evaluateFinish() as never, partials, request)) as AxeResults;
 	return normalizeA11yResult(page.url(), raw, options.includeIncomplete === true);
 }
 
 /** Build a standalone page-world axe audit script for the cmux backend. */
 export function buildA11yPageScript(options: BrowserA11yOptions = {}): string {
 	const request = JSON.stringify(serializeOptions(options));
-	return `(${evaluateStandalone.toString()})(${request})`;
+	return `(${evaluateStandalone().toString()})(${request})`;
 }
 
 function renderTarget(target: string[] | string[][]): string {

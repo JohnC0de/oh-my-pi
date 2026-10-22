@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Browser accessibility checks now initialize on first use instead of during every session's startup.
+
 ## [18.12.6] - 2026-10-21
 
 ### Added

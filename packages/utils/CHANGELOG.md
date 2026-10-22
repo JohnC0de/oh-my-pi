@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `JsonPrefixScanner` for incremental strict-JSON classification with isolated continuation probes.
+
 ## [18.12.6] - 2026-10-21
 
 ### Added

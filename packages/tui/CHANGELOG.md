@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Reduced CPU use and retained render caches while long assistant responses stream into terminal scrollback.
+
 ## [18.12.6] - 2026-10-21
 
 ### Changed

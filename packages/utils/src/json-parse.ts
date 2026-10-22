@@ -417,174 +417,316 @@ const enum JsonExpect {
  * A top-level number at end-of-input classifies as `"complete"` even though
  * more digits could extend it; tool-argument buffers are always objects, so
  * the ambiguity is immaterial here.
+ *
+ * Stateless wrapper over {@link JsonPrefixScanner}; callers that classify a
+ * growing buffer repeatedly should keep a scanner instead.
  */
 export function classifyJsonPrefix(text: string): JsonPrefixState {
-	const n = text.length;
-	let i = 0;
+	const scanner = new JsonPrefixScanner();
+	scanner.feed(text);
+	return scanner.state;
+}
+
+// Number grammar phases for the resumable scanner (plain constants, not an enum).
+/** Not inside a number. */
+const NUM_NONE = 0;
+/** After `-`: a digit must follow. */
+const NUM_SIGN = 1;
+/** After a leading `0`: only `.`, `e`/`E`, or the end may follow. */
+const NUM_ZERO = 2;
+/** Inside integer digits `1-9…`. */
+const NUM_INT = 3;
+/** After `.`: a digit must follow. */
+const NUM_FRAC_START = 4;
+const NUM_FRAC = 5;
+/** After `e`/`E`: a sign or digit must follow. */
+const NUM_EXP_START = 6;
+/** After the exponent sign: a digit must follow. */
+const NUM_EXP_SIGN = 7;
+const NUM_EXP = 8;
+
+/**
+ * Resumable form of {@link classifyJsonPrefix}: `feed` appends text and the
+ * scanner continues from where it stopped, so classifying a buffer that grows
+ * by appends costs O(appended) per step instead of O(buffer). After any
+ * sequence of feeds, {@link state} equals `classifyJsonPrefix(allFedText)`.
+ *
+ * Strings and numbers resume mid-token: escape and `\uXXXX` progress and the
+ * number grammar phase are kept, so arbitrarily long tokens are scanned once.
+ * A keyword (`true`/`false`/`null`) cut by a chunk boundary is held back, at
+ * most four characters, and rescanned with the next chunk.
+ */
+export class JsonPrefixScanner {
+	/** Total characters fed so far. */
+	consumed = 0;
 	// Container stack: true = object, false = array.
-	const stack: boolean[] = [];
-	let expect = JsonExpect.Value;
+	#stack: boolean[] = [];
+	#expect = JsonExpect.Value;
+	#invalid = false;
+	/** Inside a string: whether it is an object key (the next expectation is a colon). */
+	#inString = false;
+	#stringIsKey = false;
+	/** Inside a string escape: just saw `\`. */
+	#afterBackslash = false;
+	/** Inside a string escape: `\u` hex digits still expected. */
+	#hexLeft = 0;
+	/** Unfinished keyword text at the end of input (at most 4 chars), rescanned on the next feed. */
+	#pendingKeyword = "";
+	/** Number grammar phase (`NUM_*`) while inside a number token, else `NUM_NONE`. */
+	#numPhase = NUM_NONE;
 
-	/** Consume a string starting at the opening quote. 1 = ok, 0 = prefix, -1 = invalid. */
-	const scanString = (): 1 | 0 | -1 => {
-		i++; // opening quote
-		while (i < n) {
-			const c = text.charCodeAt(i);
-			if (c === QUOTE) {
-				i++;
-				return 1;
-			}
-			if (c === BACKSLASH) {
-				i++;
-				if (i >= n) return 0;
-				const e = text.charCodeAt(i);
-				if (e >= 128 || !VALID_ESCAPE_CHAR[e]) return -1;
-				i++;
-				if (e === U) {
-					for (let k = 0; k < 4; k++, i++) {
-						if (i >= n) return 0;
-						if (!isHexDigit(text.charCodeAt(i))) return -1;
-					}
-				}
-				continue;
-			}
-			if (c < 0x20) return -1; // raw control char: strict JSON forbids it
-			i++;
+	get state(): JsonPrefixState {
+		if (this.#invalid) return "invalid";
+		if (this.#inString) return "prefix";
+		if (this.#pendingKeyword.length > 0) return "prefix";
+		if (this.#numPhase !== NUM_NONE) {
+			// A number can end after any digit: integer, fraction or exponent.
+			const canEnd =
+				this.#numPhase === NUM_ZERO ||
+				this.#numPhase === NUM_INT ||
+				this.#numPhase === NUM_FRAC ||
+				this.#numPhase === NUM_EXP;
+			return canEnd && this.#stack.length === 0 ? "complete" : "prefix";
 		}
-		return 0;
-	};
+		return this.#expect === JsonExpect.End ? "complete" : "prefix";
+	}
 
-	/** Consume a number starting at `-` or a digit. 1 = token done, 0 = prefix, -1 = invalid. */
-	const scanNumber = (): 1 | 0 | -1 => {
-		if (text.charCodeAt(i) === 0x2d) i++; // -
-		if (i >= n) return 0;
-		let c = text.charCodeAt(i);
-		if (c === 0x30) {
-			i++; // 0: no further integer digits allowed
-		} else if (c >= 0x31 && c <= 0x39) {
-			while (i < n && text.charCodeAt(i) >= 0x30 && text.charCodeAt(i) <= 0x39) i++;
-		} else {
-			return -1;
-		}
-		if (i < n && text.charCodeAt(i) === 0x2e) {
-			i++; // .
-			if (i >= n) return 0;
-			if (text.charCodeAt(i) < 0x30 || text.charCodeAt(i) > 0x39) return -1;
-			while (i < n && text.charCodeAt(i) >= 0x30 && text.charCodeAt(i) <= 0x39) i++;
-		}
-		c = i < n ? text.charCodeAt(i) : 0;
-		if (c === 0x65 || c === 0x45) {
-			i++; // e | E
-			if (i < n && (text.charCodeAt(i) === 0x2b || text.charCodeAt(i) === 0x2d)) i++;
-			if (i >= n) return 0;
-			if (text.charCodeAt(i) < 0x30 || text.charCodeAt(i) > 0x39) return -1;
-			while (i < n && text.charCodeAt(i) >= 0x30 && text.charCodeAt(i) <= 0x39) i++;
-		}
-		return 1;
-	};
+	/** Independent copy: probe a continuation without advancing this scanner. */
+	clone(): JsonPrefixScanner {
+		const copy = new JsonPrefixScanner();
+		copy.consumed = this.consumed;
+		copy.#stack = this.#stack.slice();
+		copy.#expect = this.#expect;
+		copy.#invalid = this.#invalid;
+		copy.#inString = this.#inString;
+		copy.#stringIsKey = this.#stringIsKey;
+		copy.#afterBackslash = this.#afterBackslash;
+		copy.#hexLeft = this.#hexLeft;
+		copy.#pendingKeyword = this.#pendingKeyword;
+		copy.#numPhase = this.#numPhase;
+		return copy;
+	}
 
-	/** Consume `true`/`false`/`null`. 1 = done, 0 = prefix, -1 = invalid. */
-	const scanKeyword = (): 1 | 0 | -1 => {
-		for (const word of ["true", "false", "null"] as const) {
-			if (word.charCodeAt(0) !== text.charCodeAt(i)) continue;
-			const available = Math.min(word.length, n - i);
-			if (!word.startsWith(text.slice(i, i + available))) return -1;
-			i += available;
-			return available === word.length ? 1 : 0;
+	feed(chunk: string): JsonPrefixState {
+		this.consumed += chunk.length;
+		if (this.#invalid || chunk.length === 0) return this.state;
+		let text = chunk;
+		if (this.#pendingKeyword.length > 0) {
+			text = this.#pendingKeyword + chunk;
+			this.#pendingKeyword = "";
 		}
-		return -1;
-	};
+		if (!this.#scan(text)) this.#invalid = true;
+		return this.state;
+	}
 
-	/** A value just finished; the next expectation follows from the stack. */
-	const valueDone = (): JsonExpect =>
-		stack.length === 0
+	/** Next expectation once a value finishes, from the container stack. */
+	#valueDone(): JsonExpect {
+		const stack = this.#stack;
+		return stack.length === 0
 			? JsonExpect.End
 			: stack[stack.length - 1]
 				? JsonExpect.ObjCommaOrEnd
 				: JsonExpect.ArrCommaOrEnd;
-
-	while (i < n) {
-		const c = text.charCodeAt(i);
-		if (isWhitespace(c)) {
-			i++;
-			continue;
-		}
-		switch (expect) {
-			case JsonExpect.Value:
-			case JsonExpect.ArrValueOrEnd: {
-				if (c === 0x5d && expect === JsonExpect.ArrValueOrEnd) {
-					stack.pop();
-					i++;
-					expect = valueDone();
-					break;
-				}
-				if (c === 0x7b) {
-					stack.push(true);
-					i++;
-					expect = JsonExpect.ObjKeyOrEnd;
-					break;
-				}
-				if (c === 0x5b) {
-					stack.push(false);
-					i++;
-					expect = JsonExpect.ArrValueOrEnd;
-					break;
-				}
-				let r: 1 | 0 | -1;
-				if (c === QUOTE) r = scanString();
-				else if (c === 0x2d || (c >= 0x30 && c <= 0x39)) r = scanNumber();
-				else if (c === 0x74 || c === 0x66 || c === 0x6e) r = scanKeyword();
-				else return "invalid";
-				if (r === -1) return "invalid";
-				if (r === 0) return "prefix";
-				expect = valueDone();
-				break;
-			}
-			case JsonExpect.ObjKeyOrEnd:
-			case JsonExpect.ObjKey: {
-				if (c === 0x7d && expect === JsonExpect.ObjKeyOrEnd) {
-					stack.pop();
-					i++;
-					expect = valueDone();
-					break;
-				}
-				if (c !== QUOTE) return "invalid";
-				const r = scanString();
-				if (r === -1) return "invalid";
-				if (r === 0) return "prefix";
-				expect = JsonExpect.ObjColon;
-				break;
-			}
-			case JsonExpect.ObjColon:
-				if (c !== 0x3a) return "invalid";
-				i++;
-				expect = JsonExpect.Value;
-				break;
-			case JsonExpect.ObjCommaOrEnd:
-				if (c === 0x7d) {
-					stack.pop();
-					i++;
-					expect = valueDone();
-					break;
-				}
-				if (c !== 0x2c) return "invalid";
-				i++;
-				expect = JsonExpect.ObjKey;
-				break;
-			case JsonExpect.ArrCommaOrEnd:
-				if (c === 0x5d) {
-					stack.pop();
-					i++;
-					expect = valueDone();
-					break;
-				}
-				if (c !== 0x2c) return "invalid";
-				i++;
-				expect = JsonExpect.Value;
-				break;
-			case JsonExpect.End:
-				return "invalid"; // trailing non-whitespace after a complete value
-		}
 	}
-	return expect === JsonExpect.End ? "complete" : "prefix";
+
+	/** Continue a string body at `i`. Returns the index after the closing quote, `n` if unfinished, or -1 if invalid. */
+	#scanString(text: string, i: number): number {
+		const n = text.length;
+		while (i < n) {
+			const c = text.charCodeAt(i);
+			if (this.#afterBackslash) {
+				if (c >= 128 || !VALID_ESCAPE_CHAR[c]) return -1;
+				this.#afterBackslash = false;
+				if (c === U) this.#hexLeft = 4;
+				i++;
+				continue;
+			}
+			if (this.#hexLeft > 0) {
+				if (!isHexDigit(c)) return -1;
+				this.#hexLeft--;
+				i++;
+				continue;
+			}
+			if (c === QUOTE) {
+				this.#inString = false;
+				this.#expect = this.#stringIsKey ? JsonExpect.ObjColon : this.#valueDone();
+				return i + 1;
+			}
+			if (c === BACKSLASH) this.#afterBackslash = true;
+			else if (c < 0x20) return -1; // raw control char: strict JSON forbids it
+			i++;
+		}
+		return n;
+	}
+
+	/**
+	 * Continue a number at `i` from {@link #numPhase}. On a character that cannot
+	 * extend it, the number ends (if its phase allows) and that index is
+	 * returned for the main loop. Returns `n` while unfinished, -1 if invalid.
+	 */
+	#scanNumber(text: string, i: number): number {
+		const n = text.length;
+		let phase = this.#numPhase;
+		for (; i < n; i++) {
+			const c = text.charCodeAt(i);
+			const digit = c >= 0x30 && c <= 0x39;
+			switch (phase) {
+				case NUM_SIGN:
+					if (c === 0x30) phase = NUM_ZERO;
+					else if (digit) phase = NUM_INT;
+					else return -1;
+					continue;
+				case NUM_ZERO:
+				case NUM_INT:
+					if (digit && phase === NUM_INT) continue;
+					if (c === 0x2e) phase = NUM_FRAC_START;
+					else if (c === 0x65 || c === 0x45) phase = NUM_EXP_START;
+					else return this.#endNumber(i);
+					continue;
+				case NUM_FRAC_START:
+					if (!digit) return -1;
+					phase = NUM_FRAC;
+					continue;
+				case NUM_FRAC:
+					if (digit) continue;
+					if (c === 0x65 || c === 0x45) phase = NUM_EXP_START;
+					else return this.#endNumber(i);
+					continue;
+				case NUM_EXP_START:
+					if (c === 0x2b || c === 0x2d) phase = NUM_EXP_SIGN;
+					else if (digit) phase = NUM_EXP;
+					else return -1;
+					continue;
+				case NUM_EXP_SIGN:
+					if (!digit) return -1;
+					phase = NUM_EXP;
+					continue;
+				default: // NUM_EXP
+					if (digit) continue;
+					return this.#endNumber(i);
+			}
+		}
+		this.#numPhase = phase;
+		return n;
+	}
+
+	#endNumber(i: number): number {
+		this.#numPhase = NUM_NONE;
+		this.#expect = this.#valueDone();
+		return i;
+	}
+
+	/** Scan `text` from the current state. Returns false once the input is invalid. */
+	#scan(text: string): boolean {
+		const n = text.length;
+		let i = 0;
+		if (this.#inString) {
+			i = this.#scanString(text, i);
+			if (i < 0) return false;
+		} else if (this.#numPhase !== NUM_NONE) {
+			i = this.#scanNumber(text, i);
+			if (i < 0) return false;
+		}
+		while (i < n) {
+			const c = text.charCodeAt(i);
+			if (isWhitespace(c)) {
+				i++;
+				continue;
+			}
+			switch (this.#expect) {
+				case JsonExpect.Value:
+				case JsonExpect.ArrValueOrEnd: {
+					if (c === 0x5d && this.#expect === JsonExpect.ArrValueOrEnd) {
+						this.#stack.pop();
+						i++;
+						this.#expect = this.#valueDone();
+						break;
+					}
+					if (c === 0x7b) {
+						this.#stack.push(true);
+						i++;
+						this.#expect = JsonExpect.ObjKeyOrEnd;
+						break;
+					}
+					if (c === 0x5b) {
+						this.#stack.push(false);
+						i++;
+						this.#expect = JsonExpect.ArrValueOrEnd;
+						break;
+					}
+					if (c === QUOTE) {
+						this.#inString = true;
+						this.#stringIsKey = false;
+						i = this.#scanString(text, i + 1);
+						if (i < 0) return false;
+						break;
+					}
+					if (c === 0x2d || (c >= 0x30 && c <= 0x39)) {
+						this.#numPhase = c === 0x2d ? NUM_SIGN : c === 0x30 ? NUM_ZERO : NUM_INT;
+						i = this.#scanNumber(text, i + 1);
+						if (i < 0) return false;
+						break;
+					}
+					if (c === 0x74 || c === 0x66 || c === 0x6e) {
+						const word = c === 0x74 ? "true" : c === 0x66 ? "false" : "null";
+						const available = Math.min(word.length, n - i);
+						if (!word.startsWith(text.slice(i, i + available))) return false;
+						if (available < word.length) {
+							this.#pendingKeyword = text.slice(i);
+							return true;
+						}
+						i += available;
+						this.#expect = this.#valueDone();
+						break;
+					}
+					return false;
+				}
+				case JsonExpect.ObjKeyOrEnd:
+				case JsonExpect.ObjKey: {
+					if (c === 0x7d && this.#expect === JsonExpect.ObjKeyOrEnd) {
+						this.#stack.pop();
+						i++;
+						this.#expect = this.#valueDone();
+						break;
+					}
+					if (c !== QUOTE) return false;
+					this.#inString = true;
+					this.#stringIsKey = true;
+					i = this.#scanString(text, i + 1);
+					if (i < 0) return false;
+					break;
+				}
+				case JsonExpect.ObjColon:
+					if (c !== 0x3a) return false;
+					i++;
+					this.#expect = JsonExpect.Value;
+					break;
+				case JsonExpect.ObjCommaOrEnd:
+					if (c === 0x7d) {
+						this.#stack.pop();
+						i++;
+						this.#expect = this.#valueDone();
+						break;
+					}
+					if (c !== 0x2c) return false;
+					i++;
+					this.#expect = JsonExpect.ObjKey;
+					break;
+				case JsonExpect.ArrCommaOrEnd:
+					if (c === 0x5d) {
+						this.#stack.pop();
+						i++;
+						this.#expect = this.#valueDone();
+						break;
+					}
+					if (c !== 0x2c) return false;
+					i++;
+					this.#expect = JsonExpect.Value;
+					break;
+				case JsonExpect.End:
+					return false; // trailing non-whitespace after a complete value
+			}
+		}
+		return true;
+	}
 }

@@ -1,5 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { classifyJsonPrefix, parseJsonWithRepair, parseStreamingJson, repairJson } from "@oh-my-pi/pi-utils/json-parse";
+import {
+	classifyJsonPrefix,
+	JsonPrefixScanner,
+	parseJsonWithRepair,
+	parseStreamingJson,
+	repairJson,
+} from "@oh-my-pi/pi-utils/json-parse";
 
 describe("JSON repair", () => {
 	it("leaves valid string escapes unchanged", () => {
@@ -66,6 +72,86 @@ describe("classifyJsonPrefix strict streaming classification", () => {
 		for (const { name, input, expected } of cases) {
 			expect(classifyJsonPrefix(input), name).toBe(expected);
 		}
+	});
+});
+
+describe("JsonPrefixScanner resumable classification", () => {
+	const inputs = [
+		"",
+		" \t\n\r",
+		'{"command":"echo {1..3}"}',
+		'{"a":[1,{"b":true},null],"c":-12.5e+3,"d":false}',
+		'{"a":"\\u00e9\\n\\"\\\\é😀"}',
+		'{"command":"echo hello\n',
+		'{"a":1}{',
+		"{1..3}",
+		'{"a":"\\q"}',
+		'{"a":01}',
+		'{"a":tru}',
+		"12",
+		"12 3",
+		"[0.5, 1e9]",
+		'{"a":[{"b":[{"c":"}]{"}]}]}  ',
+	];
+
+	it("matches classifyJsonPrefix on every prefix when fed one character at a time", () => {
+		for (const input of inputs) {
+			const scanner = new JsonPrefixScanner();
+			expect(scanner.state, `empty prefix of ${JSON.stringify(input)}`).toBe(classifyJsonPrefix(""));
+			for (let end = 1; end <= input.length; end++) {
+				const state = scanner.feed(input.slice(end - 1, end));
+				expect(state, JSON.stringify(input.slice(0, end))).toBe(classifyJsonPrefix(input.slice(0, end)));
+			}
+			expect(scanner.consumed).toBe(input.length);
+		}
+	});
+
+	it("matches classifyJsonPrefix for every two-chunk split", () => {
+		for (const input of inputs) {
+			const expected = classifyJsonPrefix(input);
+			for (let split = 0; split <= input.length; split++) {
+				const scanner = new JsonPrefixScanner();
+				scanner.feed(input.slice(0, split));
+				expect(scanner.feed(input.slice(split)), `${JSON.stringify(input)} @${split}`).toBe(expected);
+			}
+		}
+	});
+
+	it("probes a continuation through clone without advancing the original", () => {
+		const scanner = new JsonPrefixScanner();
+		scanner.feed('{"command":"echo ');
+		expect(scanner.clone().feed('{1..3}"}')).toBe("complete");
+		expect(scanner.clone().feed("\n")).toBe("invalid");
+		expect(scanner.state).toBe("prefix");
+		expect(scanner.consumed).toBe(17);
+		expect(scanner.feed('done"}')).toBe("complete");
+	});
+
+	it("keeps a split unicode escape and a pending number across chunks", () => {
+		const escape = new JsonPrefixScanner();
+		escape.feed('{"a":"\\u0');
+		expect(escape.state).toBe("prefix");
+		expect(escape.clone().feed("0zz")).toBe("invalid");
+		expect(escape.feed('0e9"}')).toBe("complete");
+
+		const number = new JsonPrefixScanner();
+		expect(number.feed("1")).toBe("complete");
+		expect(number.feed("2")).toBe("complete");
+		expect(number.feed(".")).toBe("prefix");
+		expect(number.feed("5 ")).toBe("complete");
+		expect(number.feed("x")).toBe("invalid");
+		expect(number.feed("}")).toBe("invalid");
+	});
+
+	it("resumes a long number token across chunks without changing its classification", () => {
+		const scanner = new JsonPrefixScanner();
+		scanner.feed('{"n":-');
+		for (let i = 0; i < 1000; i++) expect(scanner.feed("1234567890")).toBe("prefix");
+		expect(scanner.feed(".")).toBe("prefix");
+		expect(scanner.feed("5e")).toBe("prefix");
+		expect(scanner.clone().feed("}")).toBe("invalid");
+		expect(scanner.feed("-7")).toBe("prefix");
+		expect(scanner.feed("}")).toBe("complete");
 	});
 });
 

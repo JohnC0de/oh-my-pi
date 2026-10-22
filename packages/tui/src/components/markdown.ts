@@ -3064,9 +3064,12 @@ export class Markdown implements Component {
 		let contentLines: string[];
 		this.#activeRenderSignature = signature;
 		try {
-			contentLines = this.transientRenderCache
-				? this.#renderStreamingContentLines(tokens, normalizedText, signature, contentWidth)
-				: this.#renderContentLines(tokens, 0, tokens.length, contentWidth, signature);
+			// Growing finalized-mode views (including transcript stable heads) retain
+			// the same frozen prefix, without transient token speculation.
+			contentLines =
+				this.transientRenderCache || this.#streamPrefixText !== undefined
+					? this.#renderStreamingContentLines(tokens, normalizedText, signature, contentWidth)
+					: this.#renderContentLines(tokens, 0, tokens.length, contentWidth, signature);
 		} finally {
 			this.#activeRenderSignature = undefined;
 		}

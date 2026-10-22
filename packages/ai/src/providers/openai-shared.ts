@@ -27,6 +27,7 @@ import {
 	cloneJsonTree,
 	extractHttpStatusFromError,
 	isRecord,
+	JsonPrefixScanner,
 	logger,
 	parseImageMetadata,
 	parseStreamingJsonThrottled,
@@ -3313,6 +3314,9 @@ export async function processResponsesStream<TApi extends Api>(
 	};
 	const hasOpenItemKey = (event: { output_index?: number; item_id?: string }): boolean =>
 		typeof event.output_index === "number" || event.item_id !== undefined;
+	// Feed accepted deltas directly: slicing a growing rope string flattens
+	// and copies the whole buffer even when the scanner reads only its tail.
+	const argumentPrefixScanners = new WeakMap<object, { scanner: JsonPrefixScanner; hasContent: boolean }>();
 	const startsJsonObjectDelta = (delta: unknown): boolean => {
 		if (typeof delta !== "string") return false;
 		for (let index = 0; index < delta.length; index++) {
@@ -3337,7 +3341,6 @@ export async function processResponsesStream<TApi extends Api>(
 			return false;
 		}
 		const partial = candidate.block[kStreamingPartialJson];
-		if (partial.trim().length === 0) return false;
 		// A `{`-starting identifierless delta is ambiguous: the opening of a new
 		// sibling call, or continuation bytes inside the candidate's own argument
 		// JSON (`{"command":"echo ` + `{1..3}"}`). Advance only when the candidate
@@ -3345,9 +3348,15 @@ export async function processResponsesStream<TApi extends Api>(
 		// already unsalvageable (lossy hosts abandon buffers mid-string, leaving
 		// raw control characters strict JSON forbids), or the concatenation would
 		// break it. Otherwise the delta is a legal continuation and must stay.
-		const state = classifyJsonPrefix(partial);
-		if (state !== "prefix") return true;
-		return classifyJsonPrefix(partial + delta) === "invalid";
+		let prefix = argumentPrefixScanners.get(candidate.block);
+		if (!prefix || prefix.scanner.consumed !== partial.length) {
+			const scanner = new JsonPrefixScanner();
+			scanner.feed(partial);
+			prefix = { scanner, hasContent: partial.trim().length > 0 };
+			argumentPrefixScanners.set(candidate.block, prefix);
+		}
+		if (!prefix.hasContent) return false;
+		return prefix.scanner.state !== "prefix" || prefix.scanner.clone().feed(delta) === "invalid";
 	};
 	const hasLaterUnfinishedFunctionCall = (start: number): boolean => {
 		for (let index = start + 1; index < openItemsInOrder.length; index++) {
@@ -3652,6 +3661,15 @@ export async function processResponsesStream<TApi extends Api>(
 			const entry = lookupOpenFunctionCallItem(event);
 			if (entry?.item.type === "function_call" && entry.block.type === "toolCall") {
 				accumulateToolCallArgumentsDelta(entry.block, event.delta, stream, output, contentIndexOf(entry.block));
+				const prefix = argumentPrefixScanners.get(entry.block);
+				if (
+					prefix &&
+					typeof event.delta === "string" &&
+					prefix.scanner.consumed + event.delta.length === entry.block[kStreamingPartialJson]?.length
+				) {
+					prefix.scanner.feed(event.delta);
+					if (!prefix.hasContent) prefix.hasContent = event.delta.trim().length > 0;
+				}
 			}
 		} else if (event.type === "response.function_call_arguments.done") {
 			const entry = lookupOpenFunctionCallItem(event);

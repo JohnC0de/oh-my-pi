@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed excessive CPU use while streaming large tool arguments from Responses hosts that omit call identifiers, including llama.cpp and Ollama.
+
 ## [18.12.5] - 2026-10-21
 
 ### Added

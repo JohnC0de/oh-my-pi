@@ -504,6 +504,44 @@ describe("processResponsesStream: parallel function_call items", () => {
 		]);
 	});
 
+	test("keeps many brace-led identifierless chunks of a long string on the current sibling", async () => {
+		const output = makeOutput();
+		const stream = { push: () => {}, end: () => {} } as never;
+		const unit = "{x:1} é😀\\n\\u00e9";
+		const chunks = ['{"content":"', ...Array.from({ length: 400 }, () => unit), '"}'];
+
+		await processResponsesStream(
+			makeStream([
+				{
+					type: "response.output_item.added",
+					item: { type: "function_call", id: "fc_a", call_id: "call_a", name: "write", arguments: "" },
+				},
+				{
+					type: "response.output_item.added",
+					item: { type: "function_call", id: "fc_b", call_id: "call_b", name: "write", arguments: "" },
+				},
+				...chunks.map(delta => ({ type: "response.function_call_arguments.delta", delta })),
+				{ type: "response.function_call_arguments.delta", delta: '{"content":"b"}' },
+				{
+					type: "response.output_item.done",
+					item: { type: "function_call", id: "fc_a", call_id: "call_a", name: "write", arguments: "" },
+				},
+				{
+					type: "response.output_item.done",
+					item: { type: "function_call", id: "fc_b", call_id: "call_b", name: "write", arguments: "" },
+				},
+			]),
+			output,
+			stream,
+			makeModel(),
+		);
+
+		const [blockA, blockB] = output.content;
+		if (blockA?.type !== "toolCall" || blockB?.type !== "toolCall") throw new Error("expected toolCalls");
+		expect(blockA.arguments).toEqual(JSON.parse(chunks.join("")));
+		expect(blockB.arguments).toEqual({ content: "b" });
+	});
+
 	test("routes deltas by item.call_id when llama.cpp omits item.id and output_index (issue #2015)", async () => {
 		// llama.cpp's `to_json_oaicompat_resp` (tools/server/server-task.cpp) emits a
 		// function_call's `output_item.added` with only `item.call_id` — no `item.id`,
