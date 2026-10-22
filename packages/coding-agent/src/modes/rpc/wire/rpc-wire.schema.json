@@ -2707,6 +2707,9 @@
 				"timedOut": {
 					"type": "boolean"
 				},
+				"memoryLimitExceeded": {
+					"type": "boolean"
+				},
 				"artifactId": {
 					"type": "string"
 				},

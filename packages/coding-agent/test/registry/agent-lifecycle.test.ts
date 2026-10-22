@@ -143,10 +143,19 @@ describe("AgentLifecycleManager", () => {
 		registerIdleSub("2-Sub", stub.session);
 		lifecycle.adopt("2-Sub", { idleTtlMs: TTL });
 		registry.setStatus("2-Sub", "running");
+		await lifecycle.park("2-Sub");
+		expect(stub.disposeCalls()).toBe(0);
 
 		vi.advanceTimersByTime(TTL * 10);
 		await flushAsync();
 		expect(registry.get("2-Sub")?.status).toBe("running");
+		expect(registry.get("2-Sub")?.session).toBe(stub.session);
+		expect(stub.disposeCalls()).toBe(0);
+
+		registry.setStatus("2-Sub", "idle");
+		const pendingPark = lifecycle.park("2-Sub");
+		registry.setStatus("2-Sub", "running");
+		await pendingPark;
 		expect(registry.get("2-Sub")?.session).toBe(stub.session);
 		expect(stub.disposeCalls()).toBe(0);
 

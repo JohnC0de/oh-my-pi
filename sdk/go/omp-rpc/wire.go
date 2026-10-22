@@ -2591,6 +2591,7 @@ type BashResult struct {
 	OutputBytes         int64                      `json:"outputBytes"`
 	ExitCode            *int64                     `json:"exitCode,omitempty"`
 	TimedOut            *bool                      `json:"timedOut,omitempty"`
+	MemoryLimitExceeded *bool                      `json:"memoryLimitExceeded,omitempty"`
 	ArtifactID          *string                    `json:"artifactId,omitempty"`
 	ArtifactElidedBytes *int64                     `json:"artifactElidedBytes,omitempty"`
 	ArtifactError       map[string]json.RawMessage `json:"artifactError,omitempty"`
@@ -2614,6 +2615,7 @@ func (v *BashResult) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("outputBytes", &out.OutputBytes)
 	d.optional("exitCode", &out.ExitCode)
 	d.optional("timedOut", &out.TimedOut)
+	d.optional("memoryLimitExceeded", &out.MemoryLimitExceeded)
 	d.optional("artifactId", &out.ArtifactID)
 	d.optional("artifactElidedBytes", &out.ArtifactElidedBytes)
 	d.optional("artifactError", &out.ArtifactError)

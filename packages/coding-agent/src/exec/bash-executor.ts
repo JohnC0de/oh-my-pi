@@ -9,6 +9,7 @@ import {
 	type MinimizerOptions,
 	type PipeStreams,
 	PtySession,
+	type PtyRunResult,
 	Shell,
 	type ShellFilesystem,
 	type ShellRunResult,
@@ -27,11 +28,13 @@ import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
 import { loadDirenvEnv } from "./direnv";
 import { buildNonInteractiveEnv } from "./non-interactive-env";
+import { type JobMemoryFailure, monitorJobMemory } from "./job-memory";
 
 import {
 	cfgBashDirenv,
 	cfgBashDirenvLoadTimeoutMs,
 	cfgShellMinimizer,
+	cfgBashMemoryLimitMb,
 	cfgShellPath,
 	type ShellMinimizerSettings,
 } from "./settings";
@@ -40,6 +43,8 @@ export interface BashExecutorOptions {
 	cwd?: string;
 	/** Milliseconds before aborting the command; 0 disables the executor deadline. */
 	timeout?: number;
+	/** Aggregate descendant RSS in MiB; overrides bash.memoryLimitMb. 0 disables. */
+	memoryLimitMb?: number;
 	onChunk?: (chunk: string) => void;
 	/**
 	 * Receives the sink's current inline view ({@link OutputSink.preview}: the
@@ -120,6 +125,7 @@ export interface BashResult {
 	cancelled: boolean;
 	/** True when the command was killed by its timeout deadline (not a user abort). */
 	timedOut?: boolean;
+	memoryLimitExceeded?: boolean;
 	truncated: boolean;
 	totalLines: number;
 	totalBytes: number;
@@ -487,31 +493,58 @@ async function executeUserShellPty(run: {
 	pty: BashPtyOptions;
 	timeoutMs: number | undefined;
 	signal: AbortSignal | undefined;
+	memoryLimitMb: number;
 	sink: OutputSink;
 	graphics: TerminalGraphicsDecoder;
 	dump: (notice?: string) => Promise<OutputSummary & { images?: ImageContent[] }>;
 }): Promise<BashResult> {
 	const session = new PtySession();
-	const result = await session.startArgv(
-		{
-			application: run.shell,
-			args: [...ensureInteractiveShellArgs(run.shell, run.args), run.command],
-			cwd: run.cwd,
-			env: run.env,
-			timeoutMs: run.timeoutMs,
-			signal: run.signal,
-			cols: run.pty.cols,
-			rows: run.pty.rows,
-		},
-		(err, chunk) => {
-			if (err || !chunk) return;
-			run.pty.onChunk(chunk);
-			// Preserve raw bytes for the terminal display, but extract graphics
-			// before the transcript sink sanitizes or truncates the clean text.
-			const clean = run.graphics.push(chunk);
-			if (clean) run.sink.push(clean.replace(/\r\n?/gu, "\n"));
+	let pid: number | undefined;
+	let memoryFailure: JobMemoryFailure | undefined;
+	const stopMonitoring = monitorJobMemory(
+		() => (pid === undefined ? [] : [pid]),
+		run.memoryLimitMb,
+		failure => {
+			memoryFailure = failure;
+			session.kill();
 		},
 	);
+	let result: PtyRunResult;
+	try {
+		result = await session.startArgv(
+			{
+				application: run.shell,
+				args: [...ensureInteractiveShellArgs(run.shell, run.args), run.command],
+				cwd: run.cwd,
+				env: run.env,
+				timeoutMs: run.timeoutMs,
+				signal: run.signal,
+				cols: run.pty.cols,
+				rows: run.pty.rows,
+			},
+			(err, chunk) => {
+				if (err || !chunk) return;
+				run.pty.onChunk(chunk);
+				// Preserve raw bytes for the terminal display, but extract graphics
+				// before the transcript sink sanitizes or truncates the clean text.
+				const clean = run.graphics.push(chunk);
+				if (clean) run.sink.push(clean.replace(/\r\n?/gu, "\n"));
+			},
+			(err, startedPid) => {
+				if (!err) pid = startedPid;
+			},
+		);
+	} finally {
+		await stopMonitoring();
+	}
+	if (memoryFailure) {
+		return {
+			exitCode: undefined,
+			cancelled: true,
+			memoryLimitExceeded: true,
+			...(await run.dump(memoryFailure.message)),
+		};
+	}
 	if (result.timedOut) {
 		return {
 			exitCode: undefined,
@@ -540,6 +573,10 @@ async function executeUserShellPty(run: {
 
 export async function executeBash(command: string, options?: BashExecutorOptions): Promise<BashResult> {
 	const settings = await Settings.init();
+	const memoryLimitMb = options?.memoryLimitMb ?? cfgBashMemoryLimitMb.get(settings);
+	if (!Number.isFinite(memoryLimitMb) || memoryLimitMb < 0) {
+		throw new Error("bash.memoryLimitMb must be a non-negative finite number (0 disables)");
+	}
 	const baseShellConfig = settings.getShellConfig();
 	const shellConfig =
 		options?.useUserShell === true ? resolveUserShellConfig(settings, baseShellConfig) : baseShellConfig;
@@ -655,6 +692,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				pty: ptyRequest,
 				timeoutMs: requestedMs === 0 ? undefined : Math.max(1_000, requestedMs ?? 300_000),
 				signal: options?.signal,
+				memoryLimitMb,
 				sink,
 				graphics,
 				dump,
@@ -738,6 +776,15 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		}, fallbackTimeoutMs);
 	}
 
+	let memoryFailure: JobMemoryFailure | undefined;
+	const stopMonitoring = monitorJobMemory(
+		() => executionShell.pids(),
+		memoryLimitMb,
+		failure => {
+			memoryFailure = failure;
+			abortHandler();
+		},
+	);
 	let resetSession = false;
 
 	try {
@@ -778,6 +825,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				void Promise.allSettled([runPromise, cleanupPromise]);
 			}
 			let notice = "Command cancelled";
+			if (memoryFailure) notice = memoryFailure.message;
 			if (winner.kind === "timeout" && deadlineTimeoutMs !== undefined) {
 				const seconds = Math.round(deadlineTimeoutMs / 1000);
 				// With an explicit timeout the native shell owns enforcement and
@@ -792,6 +840,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				exitCode: undefined,
 				cancelled: true,
 				...(winner.kind === "timeout" ? { timedOut: true } : {}),
+				...(memoryFailure ? { memoryLimitExceeded: true } : {}),
 				...(await dump(notice)),
 			};
 		}
@@ -801,6 +850,15 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		}
 
 		// Handle timeout
+		if (memoryFailure) {
+			resetSession = true;
+			return {
+				exitCode: undefined,
+				cancelled: true,
+				memoryLimitExceeded: true,
+				...(await dump(memoryFailure.message)),
+			};
+		}
 		if (winner.result.timedOut) {
 			const annotation = options?.timeout
 				? `Command timed out after ${Math.round(options.timeout / 1000)} seconds`
@@ -869,6 +927,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		resetSession = true;
 		throw err;
 	} finally {
+		await stopMonitoring();
 		await sink.dispose();
 		if (timeoutTimer) {
 			clearTimeout(timeoutTimer);

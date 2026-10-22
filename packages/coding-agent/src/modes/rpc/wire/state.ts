@@ -150,6 +150,7 @@ export const stateDefs = {
 		"exitCode?": "number.integer",
 		cancelled: "boolean",
 		"timedOut?": "boolean",
+		"memoryLimitExceeded?": "boolean",
 		truncated: "boolean",
 		totalLines: "number.integer",
 		totalBytes: "number.integer",

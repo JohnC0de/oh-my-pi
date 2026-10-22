@@ -689,6 +689,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		outputText: string,
 	): void {
 		const captureNotice = result.artifactError ? `\n\n[${formatArtifactErrorNotice(result.artifactError)}]` : "";
+		if ("memoryLimitExceeded" in result && result.memoryLimitExceeded) {
+			throw new ToolError(`${normalizeResultOutput(result)}${captureNotice}`);
+		}
 		if (result.cancelled) {
 			// Local executor output already carries a leading `[Command cancelled]`
 			// notice from the sink; PTY/bridge output does not, so annotate only
@@ -1289,6 +1292,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			});
 		}
 
+		if (bridgeTerminalAvailable) {
+			pendingNotices.push(
+				"Client-owned ACP terminal: local bash.memoryLimitMb cannot enforce remote process memory; configure limits in the terminal host.",
+			);
+		}
 		// Fold direnv/devenv env into (command, env) ONCE for the two backends
 		// that bypass `executeBash` — the ACP client terminal and the PTY. The
 		// `executeBash` branch below is intentionally excluded: it runs its own
@@ -1625,6 +1633,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					onSessionShellBusy: () => pendingNotices.push(SESSION_SHELL_BUSY_NOTICE),
 				});
 		const wallTimeMs = performance.now() - wallTimeStart;
+		if ("memoryLimitExceeded" in result && result.memoryLimitExceeded) {
+			throw new ToolError(normalizeResultOutput(result));
+		}
 		if (result.cancelled) {
 			// A cancelled result is either a timeout (the command's deadline fired)
 			// or a user/system abort. Timeouts are handled by #buildCompletedResult

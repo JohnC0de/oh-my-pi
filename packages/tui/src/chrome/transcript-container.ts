@@ -284,6 +284,8 @@ export class TranscriptContainer extends Container {
 	 */
 	#frameRows = new Map<TranscriptEntry, readonly string[]>();
 	#frameRowsWidth = 0;
+	/** Render owners, independent of ordered retirement: a streaming head may pin it indefinitely. */
+	#renderOwners = new Set<TranscriptEntry>();
 	#releaseFailures = new WeakSet<Component>();
 	/** The `children` array `#entries` last mirrored; see {@link #syncEntries}. */
 	#syncedChildren: Component[] | undefined;
@@ -338,6 +340,8 @@ export class TranscriptContainer extends Container {
 		// #removableIndex synced entries, which now mirror children index for
 		// index. This class renders through its own entries, never Container's
 		// memoized render, so splicing children directly is the whole removal.
+		const removed = this.#entries[index];
+		if (removed) this.#releaseRenderCaches(removed);
 		this.children.splice(index, 1);
 		this.#entries.splice(index, 1);
 		this.#frontier = Math.min(this.#frontier, this.#entries.length);
@@ -346,6 +350,7 @@ export class TranscriptContainer extends Container {
 
 	override clear(): void {
 		super.clear();
+		this.#renderOwners.clear();
 		this.#entries = [];
 		this.#frontier = 0;
 		this.#offered = undefined;
@@ -550,6 +555,11 @@ export class TranscriptContainer extends Container {
 	#closeFrame(): void {
 		this.#openFrame = undefined;
 		this.#frameRows.clear();
+		const visible = new Set(this.#lastViewportSpans.map(span => span.component));
+		for (const entry of this.#renderOwners) {
+			if (entry.state === "active" || visible.has(entry.component)) continue;
+			this.#releaseRenderCaches(entry);
+		}
 	}
 
 	/** Block spans of the last `renderViewport` output, in output coordinates. Empty when the tail is empty. */
@@ -967,6 +977,7 @@ export class TranscriptContainer extends Container {
 		for (let index = this.#entries.length - 1; index >= 0; index--) {
 			const entry = this.#entries[index]!;
 			this.#setAllocation(entry.component, Number.MAX_SAFE_INTEGER, this.#lastFrame);
+			this.#renderOwners.add(entry);
 			const block = trimBlankEdges(entry.component.render(width));
 			if (entry.state === "committed") this.#releaseRenderCaches(entry);
 			if (block.length === 0) continue;
@@ -1031,6 +1042,7 @@ export class TranscriptContainer extends Container {
 	}
 
 	#renderEntry(entry: TranscriptEntry, width: number): readonly string[] {
+		this.#renderOwners.add(entry);
 		const rendered = trimBlankEdges(entry.component.render(width));
 		if (entry.state === "committed" || entry.mode === "mutable" || entry.stableFrozen) return rendered;
 		const appendOnly = entry.component as Component & AppendOnlyTranscriptBlock;
@@ -1297,6 +1309,7 @@ export class TranscriptContainer extends Container {
 			// full render of the block's stable prefix) is skipped for them. This
 			// keeps a complete-ledger replay at one render per block. These rows go
 			// to native scrollback, where nothing can repaint them.
+			this.#renderOwners.add(entry);
 			const rendered = renderForScrollback(() =>
 				index === start ? this.#renderEntry(entry, width) : trimBlankEdges(entry.component.render(width)),
 			);
@@ -1363,6 +1376,14 @@ export class TranscriptContainer extends Container {
 	}
 
 	#releaseRenderCaches(entry: TranscriptEntry): void {
+		if (!this.#renderOwners.delete(entry)) return;
+		// Semantic snapshots and the emission ledger survive eviction. Their
+		// width-dependent renders can be reconstructed on scroll, replay or rewind.
+		if (entry.state !== "active" && !entry.stableFrozen) {
+			entry.renderedStableByWidth.clear();
+			entry.stableRowCountByWidth.clear();
+			if (entry.split !== undefined) entry.split.located = undefined;
+		}
 		const release = entry.component.releaseRenderCaches;
 		if (release === undefined) return;
 		try {
@@ -1554,6 +1575,10 @@ export class TranscriptContainer extends Container {
 					split: undefined,
 				},
 		);
+		const retained = new Set(this.#entries);
+		for (const entry of this.#renderOwners) {
+			if (!retained.has(entry)) this.#releaseRenderCaches(entry);
+		}
 		this.#frontier = this.#entries.findIndex(entry => entry.state !== "committed");
 		if (this.#frontier < 0) this.#frontier = this.#entries.length;
 	}

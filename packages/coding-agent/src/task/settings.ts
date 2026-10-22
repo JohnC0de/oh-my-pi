@@ -383,13 +383,13 @@ export const cfgTaskCompletionProbe = register({
 export const cfgTaskAgentIdleTtlMs = register({
 	id: "task.agentIdleTtlMs",
 	type: "number",
-	default: 420_000,
+	default: 30_000,
 	ui: {
 		tab: "tasks",
 		group: "Subagents",
 		label: "Agent Idle TTL",
 		description:
-			"How long an idle subagent stays live in memory before being parked to disk (ms). Parked agents are revived automatically when messaged or resumed. 0 keeps idle agents live until exit.",
+			"How long an idle subagent stays live in memory before its session resources are disposed (ms; default 30000). Its persisted transcript remains available, and parked agents revive automatically when messaged or resumed. Values <= 0 keep idle agents live until exit.",
 	},
 });
 

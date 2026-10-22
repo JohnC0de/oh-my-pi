@@ -56,6 +56,29 @@ class ReleaseCountingBlock implements Component {
 	}
 }
 
+describe("off-screen cache ownership behind an unfinished frontier", () => {
+	it("evicts settled hidden blocks without losing their full render or removable history", () => {
+		const transcript = new TranscriptContainer();
+		const frontier = new ReleaseCountingBlock(["streaming"], false);
+		const hidden = new ReleaseCountingBlock(["old first", "old second"], true);
+		transcript.addChild(frontier);
+		transcript.addChild(hidden);
+		for (let index = 0; index < 8; index++) {
+			transcript.addChild(new ReleaseCountingBlock([`new ${index}`], true));
+		}
+		const original = transcript.render(80).slice();
+		transcript.peekFinalizedBatch(80, 3);
+		const visible = transcript.renderViewport(80, 3, frame).slice();
+		expect(hidden.releases).toBeGreaterThan(0);
+		expect(frontier.releases).toBe(0);
+		expect(transcript.render(80)).toEqual(original);
+		expect(transcript.renderViewport(80, 3, frame)).toEqual(visible);
+		expect(transcript.blockStates()[0]).toBe("active");
+		transcript.removeChild(hidden);
+		expect(transcript.render(80)).toEqual(["streaming", ...original.slice(4)]);
+	});
+});
+
 /** A settled block whose every cache hook throws, as a broken custom component might. */
 class ThrowingHooksBlock implements Component {
 	readonly #rows: readonly string[];
@@ -218,7 +241,7 @@ describe("committed transcript blocks release render caches", () => {
 		setMcpRenderMarkdownResults(false);
 	});
 
-	it("releases a block once when it commits and after every replay render, never while it is live", () => {
+	it("recomposes unacknowledged offers after off-screen eviction and preserves the active block", () => {
 		const transcript = new TranscriptContainer();
 		const settled = new ReleaseCountingBlock(["settled"], true);
 		const active = new ReleaseCountingBlock(["active"], false);
@@ -229,54 +252,50 @@ describe("committed transcript blocks release render caches", () => {
 		const offered = transcript.peekFinalizedBatch(80, 1);
 		if (!offered) throw new Error("expected a pressure retirement");
 		// An unacknowledged offer can still be recomposed for a discarded frame.
-		expect(settled.releases).toBe(0);
+		expect(transcript.rerenderOfferedBatch(60)?.rows).toEqual(offered.rows);
 		transcript.acknowledgeFinalizedBatch(offered.id);
 		expect(transcript.blockStates()).toEqual(["committed", "active"]);
-		expect(settled.releases).toBe(1);
 
-		replay(transcript, 60);
-		expect(settled.releases).toBe(2);
+		expect(replay(transcript, 60)).toEqual(["settled", ""]);
 
 		transcript.renderViewport(80, 10, frame);
-		expect(active.releases).toBe(0);
+		expect(transcript.blockStates()).toEqual(["committed", "active"]);
 		active.finalize();
 		const final = transcript.peekFlushBatch(80);
 		if (!final) throw new Error("expected the finalized block to retire");
 		transcript.acknowledgeFinalizedBatch(final.id);
-		expect(active.releases).toBe(1);
-		expect(settled.releases).toBe(2);
+		expect(transcript.blockStates()).toEqual(["committed", "committed"]);
+		expect(replay(transcript, 80)).toEqual(["settled", "", "active", ""]);
 		// Releasing is not a theme-change rebuild.
 		expect(settled.invalidations + active.invalidations).toBe(0);
 	});
 
-	it("keeps committed caches through replay retries until the replay batch is acknowledged", () => {
+	it("recomposes a replay at another width before acknowledgement", () => {
 		const transcript = new TranscriptContainer();
 		const block = new ReleaseCountingBlock(["committed"], true);
 		transcript.addChild(block);
 		commitAll(transcript, 80);
-		expect(block.releases).toBe(1);
+		expect(transcript.blockStates()).toEqual(["committed"]);
 
 		transcript.beginReplay();
 		const offered = transcript.peekReplayBatch(80);
 		if (!offered) throw new Error("expected a replay batch");
-		expect(block.releases).toBe(1);
 		expect(transcript.rerenderOfferedBatch(60)?.rows).toEqual(["committed", ""]);
-		expect(block.releases).toBe(1);
 
 		transcript.acknowledgeFinalizedBatch(offered.id);
-		expect(block.releases).toBe(2);
+		expect(transcript.render(60)).toEqual(["committed"]);
 	});
 
-	it("releases committed caches when replay renders no rows to acknowledge", () => {
+	it("keeps empty committed history empty when replay has no rows to acknowledge", () => {
 		const transcript = new TranscriptContainer();
 		const block = new ReleaseCountingBlock([""], true);
 		transcript.addChild(block);
 		expect(commitAll(transcript, 80)).toEqual([]);
-		expect(block.releases).toBe(1);
+		expect(transcript.blockStates()).toEqual(["committed"]);
 
 		transcript.beginReplay();
 		expect(transcript.peekReplayBatch(80)).toBeUndefined();
-		expect(block.releases).toBe(2);
+		expect(transcript.render(80)).toEqual([]);
 	});
 
 	it("never re-runs extension renderers when a block commits or replays", () => {

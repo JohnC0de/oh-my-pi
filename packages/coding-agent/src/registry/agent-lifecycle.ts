@@ -281,7 +281,7 @@ export class AgentLifecycleManager {
 
 	/**
 	 * Dispose the live session, detach it from the registry, and mark the
-	 * agent `parked`. No-op unless the id is adopted and live.
+	 * agent `parked`. No-op unless the id is adopted, idle, and live.
 	 *
 	 * The session is detached (and status flipped to `parked`) *before*
 	 * `session.dispose()` so concurrent {@link ensureLive}/peer sends never
@@ -295,7 +295,7 @@ export class AgentLifecycleManager {
 		const adopted = this.#adopted.get(id);
 		if (!adopted) return;
 		const ref = this.#registry.get(id);
-		if (!ref || adopted.ref !== ref) return;
+		if (!ref || adopted.ref !== ref || ref.status !== "idle") return;
 		const session = ref.session;
 		if (!session) return;
 
@@ -329,7 +329,7 @@ export class AgentLifecycleManager {
 
 				// Re-check liveness: release/unregister/replace may have raced us.
 				const live = this.#registry.get(id);
-				if (live !== ref || !live.session || live.session !== session) return;
+				if (live !== ref || ref.status !== "idle" || !live.session || live.session !== session) return;
 				if (this.#adopted.get(id)?.ref !== ref) return;
 
 				// Preserve cost before detaching the only live source. The session usage
@@ -664,8 +664,9 @@ export class AgentLifecycleManager {
 	}
 
 	#armTimer(id: string, adopted: AdoptedAgent): void {
-		if (adopted.idleTtlMs <= 0) return;
 		clearTimeout(adopted.timer);
+		adopted.timer = undefined;
+		if (adopted.idleTtlMs <= 0 || adopted.ref.status !== "idle") return;
 		const timer = setTimeout(() => {
 			adopted.timer = undefined;
 			void this.park(id);

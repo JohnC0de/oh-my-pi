@@ -116,6 +116,13 @@ function externalizeImagePayloadSync(
 	data: string,
 	mimeType: string | undefined,
 ): string {
+	// Cold accessors intentionally do not cache their decoded strings.
+	if (
+		Object.getOwnPropertyDescriptor(payload, "data")?.get ||
+		Object.getOwnPropertyDescriptor(payload, "result")?.get
+	) {
+		return externalizeImageDataSync(blobStore, data, mimeType);
+	}
 	let refs = externalizedImageRefs.get(blobStore);
 	const cached = refs?.get(payload);
 	if (cached && cached.data === data && cached.mimeType === mimeType) return cached.ref;

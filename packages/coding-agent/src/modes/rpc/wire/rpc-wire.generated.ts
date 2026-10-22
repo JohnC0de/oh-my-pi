@@ -530,6 +530,7 @@ export interface BashResult {
 	outputBytes: number;
 	exitCode?: number;
 	timedOut?: boolean;
+	memoryLimitExceeded?: boolean;
 	artifactId?: string;
 	artifactElidedBytes?: number;
 	artifactError?: Record<string, unknown>;

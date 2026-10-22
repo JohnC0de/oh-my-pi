@@ -14,6 +14,7 @@ import { resolveToCwd } from "../tools/path-utils";
 import { isSharedBrowserDaemonName } from "../tools/browser/shared-daemon";
 
 import { cfgLaunchEnabled } from "../tools/settings";
+import { cfgBashMemoryLimitMb } from "../exec/settings";
 
 export interface ServiceReady {
 	log?: string;
@@ -238,7 +239,7 @@ export async function startService(
 		name: params.name,
 		application: shell.shell,
 		args: [...shell.args, `${shell.prefix ? `${shell.prefix} ` : ""}${params.command}`],
-		env: { ...shell.env, ...params.env },
+		env: { ...shell.env, ...params.env, OMP_JOB_MEMORY_LIMIT_MB: String(cfgBashMemoryLimitMb.get(session.settings)) },
 		cwd: resolveToCwd(params.cwd ?? session.cwd, session.cwd),
 		pty: params.pty ?? true,
 		ready: ready

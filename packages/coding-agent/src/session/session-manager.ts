@@ -30,6 +30,7 @@ import { moveFileAcrossDevices } from "../utils/atomic-file";
 import { ArtifactManager } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore, lazyImageDataSync } from "./blob-store";
 import type { CompactionMethod } from "./compaction-methods";
+import { ColdPayloadStore } from "./cold-payloads";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -910,6 +911,7 @@ export class SessionManager {
 	#hasTitleSlot = true;
 	#entries: SessionEntry[] = [];
 	#index = new SessionEntryIndex();
+	#coldPayloads = new ColdPayloadStore();
 
 	/** File reflects all current entries; appends can go incrementally. */
 	#fileIsCurrent = false;
@@ -2065,6 +2067,8 @@ export class SessionManager {
 		const repairedUsage = normalizeLoadedUsage(entries);
 		if (repairedUsage > 0) logger.warn("Loaded assistant messages with incomplete usage", { count: repairedUsage });
 		this.#index.rebuild(entries);
+		const compaction = entries.findLast(entry => entry.type === "compaction");
+		if (compaction?.type === "compaction") this.releaseArchivedPayloads(compaction.firstKeptEntryId);
 	}
 
 	#freshEntryFields(): { id: string; parentId: string | null; timestamp: string; runtime: RuntimeIdentity } {
@@ -3584,6 +3588,7 @@ export class SessionManager {
 			preserveData: options.preserveData,
 		};
 		this.#recordEntry(entry);
+		this.releaseArchivedPayloads(firstKeptEntryId);
 		return entry.id;
 	}
 
@@ -3828,6 +3833,38 @@ export class SessionManager {
 	/** All session entries (excludes header). Returns a shallow copy. */
 	getEntries(): SessionEntry[] {
 		return [...this.#entries];
+	}
+
+	/** Release cold bodies without sealing the journal or changing mutable entry identities.
+	 * With no boundary this is an append-only consumer (advisor) retaining metadata only.
+	 */
+	releaseArchivedPayloads(firstKeptEntryId?: string): void {
+		this.#releasePayloads(firstKeptEntryId);
+	}
+
+	/** Append-only consumers release just the newly appended body's ownership. */
+	releaseEntryPayloads(entryId: string): void {
+		const entry = this.#index.get(entryId);
+		if (entry) this.#releasePayloads(undefined, entry);
+	}
+
+	#releasePayloads(firstKeptEntryId?: string, onlyEntry?: SessionEntry): void {
+		if (!this.#persist) return;
+		try {
+			if (onlyEntry) {
+				this.#coldPayloads.release(onlyEntry);
+			} else {
+				for (const entry of this.#entries) {
+					if (entry.id === firstKeptEntryId) break;
+					this.#coldPayloads.release(entry);
+				}
+			}
+		} catch (error) {
+			// Offload is optional; an unwritable temporary store must not lose a turn.
+			logger.debug("Session payload offload failed", { error: String(error) });
+		} finally {
+			forgetExternalizedImages(this.#blobs);
+		}
 	}
 
 	/**

@@ -688,6 +688,7 @@ class BashResult:
     output_bytes: int
     exit_code: int | None = None
     timed_out: bool | None = None
+    memory_limit_exceeded: bool | None = None
     artifact_id: str | None = None
     artifact_elided_bytes: int | None = None
     artifact_error: JsonObject | None = None
@@ -1965,6 +1966,7 @@ def parse_bash_result(value: object, path: str = "BashResult") -> BashResult:
         output_bytes=required(payload, "outputBytes", decode_int, path),
         exit_code=optional(payload, "exitCode", decode_int, path),
         timed_out=optional(payload, "timedOut", decode_bool, path),
+        memory_limit_exceeded=optional(payload, "memoryLimitExceeded", decode_bool, path),
         artifact_id=optional(payload, "artifactId", decode_str, path),
         artifact_elided_bytes=optional(payload, "artifactElidedBytes", decode_int, path),
         artifact_error=optional(payload, "artifactError", decode_json_object, path),

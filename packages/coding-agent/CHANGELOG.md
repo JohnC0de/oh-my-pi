@@ -5,6 +5,12 @@
 ### Changed
 
 - Browser accessibility checks now initialize on first use instead of during every session's startup.
+- Idle subagents now release session resources after 30 seconds by default; `task.agentIdleTtlMs` preserves configurable retention and revival.
+- Linux shell jobs and named services now stop with a clear error when their process tree exceeds `bash.memoryLimitMb` (4096 MiB by default; 0 disables).
+
+### Fixed
+
+- Large archived session and advisor payloads now use on-demand disk backing while preserving history, rewinds, and persisted transcripts.
 
 ## [18.12.6] - 2026-10-21
 

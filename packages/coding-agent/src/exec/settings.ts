@@ -79,6 +79,16 @@ export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [
 
 export const cfgShellPath = register({ id: "shellPath", type: "string", default: undefined });
 
+/** Sampled tree RSS, not a hard reservation; permits normal builds while
+ * stopping runaway jobs before they consume a typical workstation's RAM.
+ * Linux /proc supplies RSS without spawning a monitoring process.
+ */
+export const cfgBashMemoryLimitMb = register({
+	id: "bash.memoryLimitMb",
+	type: "number",
+	default: process.platform === "linux" ? 4096 : 0,
+});
+
 /** Pi shell command prefix forwarded to legacy extensions; OMP's native shell does not apply it. */
 export const cfgLegacyShellCommandPrefix = register({ id: "shellCommandPrefix", type: "string", default: undefined });
 

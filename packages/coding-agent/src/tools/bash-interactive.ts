@@ -6,12 +6,15 @@ import { loadXtermTerminal } from "@oh-my-pi/pi-tui/tools/terminal-output";
 import { Settings } from "../config/settings";
 import { OutputSink, type OutputSummary } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
+import { type JobMemoryFailure, monitorJobMemory } from "../exec/job-memory";
+import { cfgBashMemoryLimitMb } from "../exec/settings";
 import { resolveOutputMaxColumns, resolveOutputSinkArtifactMaxBytes, resolveOutputSinkHeadBytes } from "./output-meta";
 
 export interface BashInteractiveResult extends OutputSummary {
 	exitCode: number | undefined;
 	cancelled: boolean;
 	timedOut: boolean;
+	memoryLimitExceeded?: boolean;
 	/** Terminal graphics extracted from raw PTY output before transcript sanitization. */
 	images?: ImageContent[];
 }
@@ -29,6 +32,7 @@ export async function runInteractiveBashPty(
 	},
 ): Promise<BashInteractiveResult> {
 	const settings = await Settings.init();
+	let stopMonitoring: (() => Promise<void>) | undefined;
 	// Load the xterm Terminal ctor here (async boundary) — the ui.custom factory below is sync.
 	const XtermTerminal = await loadXtermTerminal();
 	const { shell: resolvedShell, env: shellEnv } = settings.getShellConfig();
@@ -51,6 +55,16 @@ export async function runInteractiveBashPty(
 		const result = await ui.custom<BashInteractiveResult>(
 			(tui, uiTheme, _keybindings, done) => {
 				const session = new PtySession();
+				let pid: number | undefined;
+				let memoryFailure: JobMemoryFailure | undefined;
+				stopMonitoring = monitorJobMemory(
+					() => (pid === undefined ? [] : [pid]),
+					cfgBashMemoryLimitMb.get(settings),
+					failure => {
+						memoryFailure = failure;
+						session.kill();
+					},
+				);
 				const component = new BashInteractiveOverlayComponent(
 					options.command,
 					uiTheme,
@@ -66,13 +80,15 @@ export async function runInteractiveBashPty(
 					tui.requestRender();
 					void (async () => {
 						await component.flushOutput();
+						await stopMonitoring?.();
 						const tail = graphics.finish();
 						if (tail) sink.push(tail);
-						const [summary, images] = await Promise.all([sink.dump(), graphics.images()]);
+						const [summary, images] = await Promise.all([sink.dump(memoryFailure?.message), graphics.images()]);
 						done({
 							exitCode: run.exitCode,
 							cancelled: run.cancelled,
 							timedOut: run.timedOut,
+							...(memoryFailure ? { cancelled: true, memoryLimitExceeded: true } : {}),
 							...summary,
 							...(images.length > 0 ? { images } : {}),
 						});
@@ -124,6 +140,9 @@ export async function runInteractiveBashPty(
 							if (clean) sink.push(clean.replace(/\r\n?/gu, "\n"));
 							tui.requestRender();
 						},
+						(error, startedPid) => {
+							if (!error) pid = startedPid;
+						},
 					)
 					.then(finalize)
 					.catch(error => {
@@ -136,6 +155,7 @@ export async function runInteractiveBashPty(
 		);
 		return result;
 	} finally {
+		await stopMonitoring?.();
 		await sink.dispose();
 	}
 }

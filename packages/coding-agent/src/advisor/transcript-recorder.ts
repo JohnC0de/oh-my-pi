@@ -273,9 +273,13 @@ export class AdvisorTranscriptRecorder {
 					initialCwd: cwd,
 					suppressBreadcrumb: true,
 				});
+				this.#manager.releaseArchivedPayloads();
 				this.#file = file;
 			}
-			this.#manager?.appendMessage(persisted);
+			if (this.#manager) {
+				const entryId = this.#manager.appendMessage(structuredClone(persisted));
+				this.#manager.releaseEntryPayloads(entryId);
+			}
 		});
 	}
 

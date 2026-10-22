@@ -7,6 +7,7 @@ import { FileLock, IpcConnection, IpcServer, Process, type PtyRunResult, PtySess
 import { isEnoent, isRecord, logger, postmortem, procmgr, sanitizeText, setProcessName } from "@oh-my-pi/pi-utils";
 import { TerminalQueryResponder } from "@oh-my-pi/pi-utils/vterm";
 import { hostHasInheritableConsole } from "../eval/py/spawn-options";
+import { monitorJobMemory } from "../exec/job-memory";
 import {
 	truncateHead,
 	truncateHeadBytes,
@@ -103,6 +104,8 @@ interface ManagedDaemon {
 	generation: number;
 	stopRequested: boolean;
 	logReady: boolean;
+	stopMemoryMonitoring?: () => Promise<void>;
+	memoryFailure?: string;
 	portReady: boolean;
 	readinessBuffer: string;
 	outputOffset: number;
@@ -490,6 +493,8 @@ class DaemonBroker {
 		clearInterval(this.#endpointTimer);
 		this.#endpointTimer = undefined;
 		for (const record of this.#records.values()) {
+			await record.stopMemoryMonitoring?.();
+			record.stopMemoryMonitoring = undefined;
 			const detached = record.spec.detached && !record.stopRequested && record.snapshot.pid !== undefined;
 			if (!detached && !terminalState(record.snapshot.state)) await this.#stopRecord(record, 2_000);
 			// The detached daemon outlives this broker and the next one recovers it from
@@ -787,6 +792,7 @@ class DaemonBroker {
 		record.generation++;
 		const generation = record.generation;
 		record.stopRequested = false;
+		record.memoryFailure = undefined;
 		record.snapshot.state = record.spec.ready ? "starting" : "running";
 		record.snapshot.persist = record.spec.persist;
 		record.snapshot.detached = record.spec.detached;
@@ -807,6 +813,21 @@ class DaemonBroker {
 			if (record.spec.detached) await this.#launchDetached(record, generation);
 			else if (record.spec.pty) await this.#launchPty(record, generation);
 			else this.#launchPipe(record, generation);
+			// The launching session resolves its setting; the broker owns enforcement
+			// after that session exits. Older specs have no requested RSS policy.
+			const memoryLimitMb = Number(record.spec.env?.OMP_JOB_MEMORY_LIMIT_MB ?? 0);
+			record.stopMemoryMonitoring = monitorJobMemory(
+				() => (record.snapshot.pid === undefined ? [] : [record.snapshot.pid]),
+				memoryLimitMb,
+				failure => {
+					record.memoryFailure = failure.message;
+					record.stopRequested = true;
+					record.log?.append(`${failure.message}\n`);
+					const pid = record.snapshot.pid;
+					if (pid !== undefined) Process.fromPid(pid)?.killTree();
+					else record.pty?.kill();
+				},
+			);
 			if (record.spec.ready?.port !== undefined) void this.#pollPort(record, generation, record.spec.ready);
 			this.#markReady(record);
 		} catch (error) {
@@ -1064,6 +1085,9 @@ class DaemonBroker {
 		// restartCount and overwrites record.restartTimer, orphaning the armed timer so it fires
 		// after stop() and resurrects the daemon (issue #6852).
 		if (generation !== record.generation || settledState(record.snapshot.state)) return;
+		await record.stopMemoryMonitoring?.();
+		record.stopMemoryMonitoring = undefined;
+		error = record.memoryFailure ?? error;
 		await this.#readDetachedOutput(record, generation);
 		// The output read yields, so a concurrent refresh may settle this generation first.
 		if (generation !== record.generation || settledState(record.snapshot.state)) return;
