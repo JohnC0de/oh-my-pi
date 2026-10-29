@@ -52,6 +52,33 @@ const FLUSH_INTERVAL_MS = 30_000;
 
 const SERVICE_NAME = "oh-my-pi";
 
+/** OTel SDK spec default for `OTEL_METRIC_EXPORT_TIMEOUT`. */
+const DEFAULT_METRIC_EXPORT_TIMEOUT_MS = 30_000;
+
+interface MetricReaderTiming {
+	readonly exportIntervalMillis: number;
+	readonly exportTimeoutMillis: number;
+}
+
+/**
+ * Reader timing from `OTEL_METRIC_EXPORT_INTERVAL` / `OTEL_METRIC_EXPORT_TIMEOUT`.
+ * Returns undefined when no valid interval is set, so metrics keep riding the
+ * periodic flush. The timeout is clamped to the interval because the reader
+ * rejects a timeout longer than its interval.
+ */
+function metricReaderTimingFromEnv(): MetricReaderTiming | undefined {
+	const exportIntervalMillis = parsePositiveMillis(process.env.OTEL_METRIC_EXPORT_INTERVAL);
+	if (exportIntervalMillis === undefined) return undefined;
+	const timeout = parsePositiveMillis(process.env.OTEL_METRIC_EXPORT_TIMEOUT) ?? DEFAULT_METRIC_EXPORT_TIMEOUT_MS;
+	return { exportIntervalMillis, exportTimeoutMillis: Math.min(timeout, exportIntervalMillis) };
+}
+
+function parsePositiveMillis(raw: string | undefined): number | undefined {
+	if (!raw) return undefined;
+	const value = Number(raw.trim());
+	return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
 type OtelLogLevel = "none" | logger.LogLevel;
 
 const LOG_SEVERITY: Record<logger.LogLevel, SeverityNumber> = {
@@ -165,11 +192,12 @@ export async function registerProviders(signalConfig: TelemetrySignalConfig): Pr
 		traceProvider.register({ contextManager: new AsyncLocalStorageContextManager().enable() });
 	}
 
+	const metricTiming = signalConfig.metric ? metricReaderTimingFromEnv() : undefined;
 	if (signalConfig.metric) {
 		const exporter = new OTLPMetricExporter();
 		meterProvider = new MeterProvider({
 			resource,
-			readers: [new PeriodicExportingMetricReader({ exporter })],
+			readers: [new PeriodicExportingMetricReader({ exporter, ...metricTiming })],
 		});
 		metrics.setGlobalMeterProvider(meterProvider);
 		metricRecorder = new AgentMetricRecorder(metrics.getMeter("@oh-my-pi/pi-coding-agent"));
@@ -188,8 +216,13 @@ export async function registerProviders(signalConfig: TelemetrySignalConfig): Pr
 		});
 	}
 
+	// An explicit OTEL_METRIC_EXPORT_INTERVAL owns metric cadence; the periodic
+	// flush then covers spans and log records only.
+	const flushMetrics = metricTiming === undefined;
 	const flushTimer = setInterval(() => {
-		flushTelemetryExport().catch(() => {});
+		flushProviders(flushMetrics).catch(() => {
+			/* SAFETY: periodic best-effort export; the next tick and the shutdown flush retry the same buffers */
+		});
 	}, FLUSH_INTERVAL_MS);
 	flushTimer.unref();
 
@@ -441,9 +474,13 @@ function logAttributeValue(value: unknown): AttributeValue | undefined {
 
 /** Flush buffered spans, log records, and metrics across all registered providers. */
 export async function flushTelemetryExport(): Promise<void> {
+	await flushProviders(true);
+}
+
+async function flushProviders(includeMetrics: boolean): Promise<void> {
 	const flushes: Promise<void>[] = [];
 	if (traceProvider) flushes.push(traceProvider.forceFlush());
 	if (logProvider) flushes.push(logProvider.forceFlush());
-	if (meterProvider) flushes.push(meterProvider.forceFlush());
+	if (includeMetrics && meterProvider) flushes.push(meterProvider.forceFlush());
 	await Promise.all(flushes);
 }

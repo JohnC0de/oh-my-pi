@@ -705,6 +705,7 @@ OMP initializes OTLP export only when at least one signal has an endpoint. Set `
 | `OTEL_EXPORTER_OTLP_PROTOCOL` and per-signal `..._PROTOCOL` variants                                            | Only `http/protobuf` is enabled by this runtime; another explicit protocol disables that signal |
 | `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`                                                                 | OpenTelemetry resource metadata                                                                 |
 | `OTEL_LOG_LEVEL`                                                                                                | Minimum exported OMP log level                                                                  |
+| `OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_METRIC_EXPORT_TIMEOUT`                                                     | Metric export interval and timeout in ms; unset, metrics flush with spans and logs every 30 s   |
 
 Header values are percent-decoded, so encode spaces and the `,`/`=` delimiters:
 

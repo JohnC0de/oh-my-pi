@@ -25,6 +25,8 @@ const OTEL_KEYS = [
 	"OTEL_TRACES_EXPORTER",
 	"OTEL_LOGS_EXPORTER",
 	"OTEL_METRICS_EXPORTER",
+	"OTEL_METRIC_EXPORT_INTERVAL",
+	"OTEL_METRIC_EXPORT_TIMEOUT",
 ] as const;
 
 let saved: Record<string, string | undefined>;
@@ -124,14 +126,15 @@ describe("initTelemetryExport exporter selection", () => {
 });
 
 describe("initTelemetryExport signals export path", () => {
-	it("exports every OTLP/proto signal and merged resource attributes", async () => {
+	it("exports every OTLP/proto signal, merged resource attributes, and the configured metric cadence", async () => {
 		// Positive initialization registers process-global providers, so each
 		// scenario still runs in its own process. Starting the independent probes
-		// together avoids serially paying three Bun startup and exporter-flush waits.
+		// together avoids serially paying four Bun startup and exporter-flush waits.
 		const probes = [
 			["traces", "./otel-export-probe.ts"],
 			["logs and metrics", "./otel-signals-probe.ts"],
 			["resource attributes", "./otel-resource-probe.ts"],
+			["metric export interval", "./otel-metric-interval-probe.ts"],
 		] as const;
 		const results = await Promise.all(
 			probes.map(async ([name, relativePath]) => {
@@ -152,6 +155,7 @@ describe("initTelemetryExport signals export path", () => {
 			traces: 0,
 			"logs and metrics": 0,
 			"resource attributes": 0,
+			"metric export interval": 0,
 		});
 	}, 20_000);
 });
