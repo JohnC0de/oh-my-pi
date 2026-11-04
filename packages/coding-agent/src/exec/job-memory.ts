@@ -1,5 +1,5 @@
 import { Process } from "@oh-my-pi/pi-natives";
-import { isEnoent } from "@oh-my-pi/pi-utils";
+import { hasFsCode, isEnoent } from "@oh-my-pi/pi-utils";
 
 export interface JobMemoryFailure {
 	message: string;
@@ -42,7 +42,7 @@ export function monitorJobMemory(
 				} catch (error) {
 					// The process can exit between the children() walk and the read: /proc
 					// then reports ENOENT or ESRCH. Either way it uses no memory any more.
-					if (!isEnoent(error) && (error as NodeJS.ErrnoException)?.code !== "ESRCH") throw error;
+					if (!isEnoent(error) && !hasFsCode(error, "ESRCH")) throw error;
 				}
 			} else {
 				throw new Error(
