@@ -40,7 +40,9 @@ export function monitorJobMemory(
 					const status = await Bun.file(`/proc/${ref.pid}/status`).text();
 					observedBytes += Number(/^VmRSS:\s+(\d+)/m.exec(status)?.[1] ?? 0) * 1024;
 				} catch (error) {
-					if (!isEnoent(error)) throw error;
+					// The process can exit between the children() walk and the read: /proc
+					// then reports ENOENT or ESRCH. Either way it uses no memory any more.
+					if (!isEnoent(error) && (error as NodeJS.ErrnoException)?.code !== "ESRCH") throw error;
 				}
 			} else {
 				throw new Error(
