@@ -41,8 +41,12 @@ export type FindToolInput = typeof findSchema.infer;
 /** Line ranges shown per hit in the model-facing text, strongest first. */
 const RANGES_SHOWN = 3;
 
-/** Wall-clock budget for one `find` call; a stalled judge fails instead of blocking the turn. */
+/** Judging budget for one `find` call: past it the call reports what was judged instead of blocking the turn. */
 const FIND_TIMEOUT_MS = 20_000;
+/** Extra wall time for the cascade to wrap up after the judging budget; past it the call fails. */
+const FIND_WRAP_UP_MS = 5_000;
+/** Unjudged lead files listed when judging produced no hits and coverage is not complete. */
+const LEADS_SHOWN = 8;
 
 /**
  * Resolve `find.enabled` for a session: `auto` enables `find` only when the
@@ -108,7 +112,8 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 			costGate: this.session.costGate,
 		});
 		const started = performance.now();
-		const timeout = AbortSignal.timeout(FIND_TIMEOUT_MS);
+		const deadline = AbortSignal.timeout(FIND_TIMEOUT_MS);
+		const hardStop = AbortSignal.timeout(FIND_TIMEOUT_MS + FIND_WRAP_UP_MS);
 		let result: CascadeResult;
 		try {
 			result = await runCascade({
@@ -118,17 +123,20 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 				extraKeywords: params.grep_keywords,
 				judge,
 				includeHidden: false,
-				signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+				signal: signal ? AbortSignal.any([signal, hardStop]) : hardStop,
+				deadline,
 				onProgress: message => onUpdate?.({ content: [{ type: "text", text: message }] }),
 			});
 		} catch (error) {
-			if (timeout.aborted && !signal?.aborted) {
-				throw new ToolError(`find timed out after ${formatDuration(FIND_TIMEOUT_MS)}`);
+			if (deadline.aborted && !signal?.aborted) {
+				throw new ToolError(
+					`find timed out after ${formatDuration(FIND_TIMEOUT_MS)} before the lexical scan finished; use grep`,
+				);
 			}
 			throw error;
 		}
 		const elapsedMs = performance.now() - started;
-		const { stats, threshold, keywords, coverage } = result;
+		const { stats, threshold, keywords, coverage, stopped } = result;
 		// Cascade paths are root-relative; the model and renderer want paths
 		// `read` resolves (cwd-relative files, URLs under URL scopes, including
 		// with `:start-end` selectors) without knowing the scope.
@@ -149,9 +157,12 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 		};
 		const where = scopePath === undefined ? "" : ` in ${scopePath}`;
 		const out: string[] = [];
+		const budget = formatDuration(FIND_TIMEOUT_MS);
 		if (coverage === "unavailable") {
 			out.push(
-				`find unavailable for "${query}"${where}: all ${stats.requests} judge requests failed, nothing was judged. This is not evidence of absence; use grep.`,
+				stopped
+					? `find unavailable for "${query}"${where}: the judge answered nothing within the ${budget} budget. This is not evidence of absence; read the leads below or use grep.`
+					: `find unavailable for "${query}"${where}: all ${stats.requests} judge requests failed, nothing was judged. This is not evidence of absence; read the leads below or use grep.`,
 			);
 		} else if (hits.length === 0) {
 			out.push(`no hits for "${query}"${where} (τ ${threshold.toFixed(2)})`);
@@ -160,7 +171,18 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 		}
 		if (coverage === "partial") {
 			out.push(
-				`partial: ${stats.failed} of ${stats.requests} judge requests failed; unjudged files may still match`,
+				stopped
+					? `partial: judging stopped at the ${budget} budget; unjudged files may still match`
+					: `partial: ${stats.failed} of ${stats.requests} judge requests failed; unjudged files may still match`,
+			);
+		}
+		if (coverage !== "complete" && hits.length === 0 && result.leads.length > 0) {
+			out.push(
+				"",
+				"leads (unjudged; strongest keyword and filename evidence first):",
+				...result.leads
+					.slice(0, LEADS_SHOWN)
+					.map(rel => `  ${formatPathRelativeToCwd(resolveSearchResultPath(root.path, rel), cwd)}`),
 			);
 		}
 		if (hits.length > 0) out.push("");

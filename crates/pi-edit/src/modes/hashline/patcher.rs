@@ -28,6 +28,7 @@ use crate::{
 	engine::{FileOp as EngineFileOp, HeaderKind, Resolved, StagedFile},
 	error::{EditError, Rejection},
 	files::FileSource,
+	fuzzy::similarity,
 	store::{Clipboard, EditStore, Snapshot, file_hash, payload_hash},
 };
 
@@ -312,30 +313,85 @@ fn line_carries(body_line: &str, evidence: &str) -> bool {
 	})
 }
 
-/// Body evidence that an op targets `first..=last` as currently numbered: the
-/// payload carries the first anchor's current content and, for ranges, the
-/// last anchor's current content at or after it. Checking both ends is what
-/// rejects stale numbers whichever way lines moved: after lines shift down,
-/// a stale range's first line holds content from above the intended range;
-/// after lines shift up, its last line holds content from below it. Either
-/// way that end's content is absent from the payload.
-fn body_targets(body: &[String], current_lines: &[&str], first: u32, last: u32) -> bool {
-	let Some(head) = unique_evidence(current_lines, first) else {
+/// Minimum [`similarity`] for a payload line to count as an in-place rewrite of
+/// an anchor's current content (`py-3` → `py-2`) when it no longer carries it
+/// verbatim.
+const SHIFT_RESCUE_NEAR_SIMILARITY: f64 = 0.8;
+
+/// Whether `body_line` is a near rewrite of current line `line` and of no
+/// other: similar enough, and strictly closer to it than to every other line
+/// of the file. A stale number points at a neighbor of the line the payload
+/// rewrites, so the payload stays closer to its real target and fails here.
+/// Lines wider than the reveal cap never qualify: a display may have cut them,
+/// and a rewrite from a cut view is a near copy that drops the tail.
+fn near_rewrite_of(body_line: &str, current_lines: &[&str], line: u32, evidence: &str) -> bool {
+	if evidence.chars().count() > SEEN_LINE_REVEAL_MAX_COLUMNS {
 		return false;
+	}
+	let candidate = body_line.trim();
+	let score = similarity(candidate, evidence);
+	if score < SHIFT_RESCUE_NEAR_SIMILARITY {
+		return false;
+	}
+	let candidate_len = candidate.chars().count();
+	(1_u32..).zip(current_lines).all(|(number, other)| {
+		if number == line {
+			return true;
+		}
+		let other = other.trim();
+		let other_len = other.chars().count();
+		// Edit distance is at least the length gap, so a line whose length
+		// ratio is already below `score` cannot tie or beat it.
+		let (short, long) = (candidate_len.min(other_len), candidate_len.max(other_len));
+		if long == 0 || (short as f64) < score * long as f64 {
+			return true;
+		}
+		similarity(candidate, other) < score
+	})
+}
+
+/// Index of the payload line that carries current line `line`
+/// ([`line_carries`]) or else rewrites it in place ([`near_rewrite_of`]),
+/// searched from the front or, with `from_back`, from the back.
+fn evidence_at(
+	body: &[String],
+	current_lines: &[&str],
+	line: u32,
+	from_back: bool,
+) -> Option<usize> {
+	let evidence = unique_evidence(current_lines, line)?;
+	let order: Vec<usize> = if from_back {
+		(0..body.len()).rev().collect()
+	} else {
+		(0..body.len()).collect()
 	};
-	let Some(head_at) = body.iter().position(|line| line_carries(line, head)) else {
+	order
+		.iter()
+		.copied()
+		.find(|&at| line_carries(&body[at], evidence))
+		.or_else(|| {
+			order
+				.into_iter()
+				.find(|&at| near_rewrite_of(&body[at], current_lines, line, evidence))
+		})
+}
+
+/// Body evidence that an op targets `first..=last` as currently numbered: the
+/// payload carries (or rewrites in place) the first anchor's current content
+/// and, for ranges, the last anchor's current content at or after it. Checking
+/// both ends is what rejects stale numbers whichever way lines moved: after
+/// lines shift down, a stale range's first line holds content from above the
+/// intended range; after lines shift up, its last line holds content from below
+/// it. Either way that end's content is absent from the payload, and a rewrite
+/// of the intended line stays closer to that line than to the stale one.
+fn body_targets(body: &[String], current_lines: &[&str], first: u32, last: u32) -> bool {
+	let Some(head_at) = evidence_at(body, current_lines, first, false) else {
 		return false;
 	};
 	if first == last {
 		return true;
 	}
-	let Some(tail) = unique_evidence(current_lines, last) else {
-		return false;
-	};
-	body
-		.iter()
-		.rposition(|line| line_carries(line, tail))
-		.is_some_and(|tail_at| tail_at >= head_at)
+	evidence_at(body, current_lines, last, true).is_some_and(|tail_at| tail_at >= head_at)
 }
 
 /// Anchors the guard would reject that a shift-aware reading accepts: every
@@ -980,10 +1036,14 @@ mod tests {
 		assert!(body_targets(&body(&["let v0060 = 60; // replay edit"]), &file, 1, 1));
 		// Stale anchor: the body carries another line's content.
 		assert!(!body_targets(&body(&["let v0058 = 58; // edit"]), &file, 1, 1));
-		// Prefix of a longer number / identifier is not the same line.
-		assert!(!body_targets(&body(&["let v0060 = 600;"]), &["let v0060 = 60"], 1, 1));
-		assert!(!body_targets(&body(&["process(items);"]), &["process(item"], 1, 1));
-		assert!(body_targets(&body(&["process(item); // edit"]), &["process(item"], 1, 1));
+		// Prefix of a longer number / identifier does not carry the line.
+		assert!(!line_carries("let v0060 = 600;", "let v0060 = 60"));
+		assert!(!line_carries("process(items);", "process(item"));
+		assert!(line_carries("process(item); // edit", "process(item"));
+		// A rewrite closer to a neighbor than to the anchored line is no
+		// evidence for it.
+		let near = ["let v0060 = 60;", "let v0061 = 61;"];
+		assert!(!body_targets(&body(&["let v0061 = 610;"]), &near, 1, 1));
 		// Short closers repeat everywhere and prove nothing.
 		assert!(!body_targets(&body(&["}", "x();"]), &file, 2, 2));
 		// Repeated content cannot name which copy is meant.
@@ -1002,6 +1062,27 @@ mod tests {
 		// Tail carried only before the head is not this range.
 		let reversed = body(&["let v0004 = 4;", "let v0001 = 1;"]);
 		assert!(!body_targets(&reversed, &file, 1, 4));
+	}
+
+	#[test]
+	fn body_targets_accepts_in_place_rewrites_closest_to_their_anchor() {
+		let file = [
+			"<div class=\"px-4 py-3 rounded\">",
+			"  <span class=\"label\">Total</span>",
+			"<div class=\"px-4 py-6 shadow\">",
+		];
+		// `py-3` → `py-2`: no verbatim carry, but the rewrite is closest to line
+		// 1.
+		let tweak = body(&["<div class=\"px-4 py-2 rounded\">"]);
+		assert!(body_targets(&tweak, &file, 1, 1));
+		// Anchored one line off, the same rewrite is still closest to line 1.
+		assert!(!body_targets(&tweak, &file, 2, 2));
+		assert!(!body_targets(&tweak, &file, 3, 3));
+		// Both ends rewritten in place, in order.
+		let range = body(&["<div class=\"px-4 py-2 rounded\">", "<div class=\"px-4 py-5 shadow\">"]);
+		assert!(body_targets(&range, &file, 1, 3));
+		// A heavy rewrite is no evidence either way.
+		assert!(!body_targets(&body(&["<section>"]), &file, 1, 1));
 	}
 }
 
@@ -1158,6 +1239,43 @@ mod lifecycle {
 			.unwrap_err();
 		assert!(err.contains("never displayed"), "unexpected error: {err}");
 		assert_eq!(ctx.text("case-b.ts"), before);
+	}
+
+	/// A follow-up that rewrites the shifted line in place (`18` → `180`)
+	/// instead of carrying it verbatim applies at the shifted number.
+	#[tokio::test]
+	async fn rewritten_shifted_replace_applies() {
+		let ctx = Lifecycle::new("case-b2.ts", 30);
+		let tag0 = ctx.read("case-b2.ts", &all_seen(30));
+		ctx.edit(&format!("[case-b2.ts#{tag0}]\nPUT >5:\n+// ins a\n+// ins b\n"))
+			.await
+			.unwrap();
+		let tag1 = ctx.head_tag("case-b2.ts");
+		ctx.edit(&format!("[case-b2.ts#{tag1}]\nPUT 20.=20:\n+let v0018 = 180;\n"))
+			.await
+			.unwrap();
+		let text = ctx.text("case-b2.ts");
+		assert_eq!(text.lines().nth(19), Some("let v0018 = 180;"));
+		assert_eq!(text.lines().nth(17), Some("let v0016 = 16;"));
+	}
+
+	/// The same rewrite under the stale pre-shift number stays rejected: it is
+	/// closer to the line it rewrites than to the line the stale number names.
+	#[tokio::test]
+	async fn rewritten_stale_shifted_replace_stays_rejected() {
+		let ctx = Lifecycle::new("case-b3.ts", 30);
+		let tag0 = ctx.read("case-b3.ts", &all_seen(30));
+		ctx.edit(&format!("[case-b3.ts#{tag0}]\nPUT >5:\n+// ins a\n+// ins b\n"))
+			.await
+			.unwrap();
+		let before = ctx.text("case-b3.ts");
+		let tag1 = ctx.head_tag("case-b3.ts");
+		let err = ctx
+			.edit(&format!("[case-b3.ts#{tag1}]\nPUT 18.=18:\n+let v0018 = 180;\n"))
+			.await
+			.unwrap_err();
+		assert!(err.contains("never displayed"), "unexpected error: {err}");
+		assert_eq!(ctx.text("case-b3.ts"), before);
 	}
 
 	/// Pure insertions carry no replaced content to evidence the boundary

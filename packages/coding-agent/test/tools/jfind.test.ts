@@ -329,6 +329,57 @@ describe("jfind cascade", () => {
 		}
 	});
 
+	it("returns the judged part as partial, with leads, when the deadline cuts judging short", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "jfind-cascade-deadline-"));
+		try {
+			await Bun.write(path.join(dir, "auth.ts"), "export function refreshToken() { return 1; }\n");
+			await Bun.write(path.join(dir, "other.ts"), "export const unrelated = 1;\n");
+			const deadline = new AbortController();
+			// The filename wave answers, then the budget runs out: nothing more is sent.
+			const judge = new FakeJudge(request => {
+				if ("tree" in stateOf(request)) deadline.abort();
+				return 0.9;
+			});
+			const result = await runCascade({
+				root: { path: dir, type: "directory" },
+				filesystem: urlFs(dir),
+				query: "token refresh",
+				extraKeywords: ["refreshToken"],
+				judge,
+				includeHidden: false,
+				deadline: deadline.signal,
+			});
+			expect(judge.requests).toHaveLength(1);
+			expect(result.stopped).toBe(true);
+			expect(result.coverage).toBe("partial");
+			expect(result.hits).toEqual([]);
+			expect(result.leads[0]).toBe("auth.ts");
+		} finally {
+			await removeWithRetries(dir);
+		}
+	});
+
+	it("lists unjudged leads when every judge request fails", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "jfind-tool-deadline-"));
+		try {
+			await Bun.write(path.join(dir, "auth.ts"), "export function refreshToken() { return 1; }\n");
+			vi.spyOn(ChainJudge.prototype, "judge").mockRejectedValue(new Error("402 billing account rejected"));
+			const tool = new FindTool({
+				cwd: dir,
+				hasUI: false,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				settings: Settings.isolated({ "find.enabled": "on" }),
+				modelRegistry: {} as never,
+			});
+			const result = await tool.execute("x", { query: "token refresh", grep_keywords: ["refreshToken"] });
+			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+			expect(text).toContain("leads (unjudged; strongest keyword and filename evidence first):\n  auth.ts");
+		} finally {
+			await removeWithRetries(dir);
+		}
+	});
+
 	it("keeps an empty result complete when the judge answered and nothing matched", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "jfind-cascade-empty-"));
 		try {

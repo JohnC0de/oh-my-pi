@@ -67,6 +67,13 @@ export interface CascadeOptions {
 	judge: Judge;
 	includeHidden: boolean;
 	signal?: AbortSignal;
+	/**
+	 * Judging budget: once it aborts, in-flight judgments are cut, no further
+	 * request is sent, and the cascade returns what was judged so far as
+	 * partial coverage instead of throwing. A listing or lexical scan still
+	 * running then aborts as `signal` would.
+	 */
+	deadline?: AbortSignal;
 	onProgress?: (message: string) => void;
 }
 
@@ -78,6 +85,10 @@ export interface CascadeResult {
 	threshold: number;
 	keywords: string[];
 	stats: FindStats;
+	/** Root-relative paths of the files chosen for reading, strongest lexical and filename evidence first. */
+	leads: string[];
+	/** Whether the deadline cut judging short. */
+	stopped: boolean;
 }
 
 interface FilePlan {
@@ -127,8 +138,20 @@ class Cascade {
 		failures: [],
 	};
 
+	/** Aborts judge requests and scans: the caller's signal or the judging deadline. */
+	readonly #requestSignal: AbortSignal | undefined;
+
 	constructor(options: CascadeOptions) {
 		this.#options = options;
+		const { signal, deadline } = options;
+		this.#requestSignal = signal && deadline ? AbortSignal.any([signal, deadline]) : (signal ?? deadline);
+	}
+
+	/** Set once the deadline cut a request or left one unsent. */
+	#cut = false;
+
+	get #stopped(): boolean {
+		return this.#options.deadline?.aborted === true;
 	}
 
 	#fail(phase: string, error: unknown): void {
@@ -141,7 +164,7 @@ class Cascade {
 		const { judge, signal } = this.#options;
 		const started = performance.now();
 		try {
-			const result = await judge.judge(request, { signal });
+			const result = await judge.judge(request, { signal: this.#requestSignal });
 			this.stats.requests++;
 			this.stats.apiMs += performance.now() - started;
 			this.stats.inputTokens += result.usage.input;
@@ -153,7 +176,9 @@ class Cascade {
 			this.stats.requests++;
 			this.stats.failed++;
 			this.stats.apiMs += performance.now() - started;
-			return { ok: false, error };
+			if (!this.#stopped) return { ok: false, error };
+			this.#cut = true;
+			return { ok: false, error: new Error("cut off by the time budget") };
 		}
 	}
 
@@ -166,6 +191,10 @@ class Cascade {
 		const worker = async () => {
 			while (next < jobs.length) {
 				throwIfAborted(this.#options.signal);
+				if (this.#stopped) {
+					this.#cut = true;
+					return;
+				}
 				const job = jobs[next++]!;
 				settle(job, await this.#ask(job.request));
 			}
@@ -174,7 +203,8 @@ class Cascade {
 	}
 
 	async run(): Promise<CascadeResult> {
-		const { root, filesystem, query, includeHidden, signal, onProgress } = this.#options;
+		const { root, filesystem, query, includeHidden, onProgress } = this.#options;
+		const signal = this.#requestSignal;
 		const keywords = deriveKeywords(query, this.#options.extraKeywords);
 
 		onProgress?.("lexical scan");
@@ -355,12 +385,18 @@ class Cascade {
 		this.stats.filesRead += files.length - results.size;
 		hits.sort((a, b) => b.contentScore - a.contentScore);
 		const { requests, failed } = this.stats;
-		const coverage: FindCoverage = failed === 0 ? "complete" : failed === requests ? "unavailable" : "partial";
-		return { hits, coverage, threshold: THRESHOLD, keywords, stats: this.stats };
+		const stopped = this.#cut;
+		const coverage: FindCoverage =
+			failed === 0 && !stopped ? "complete" : failed === requests ? "unavailable" : "partial";
+		const leads = selected.map(node => entries[node]!.rel);
+		return { hits, coverage, threshold: THRESHOLD, keywords, stats: this.stats, leads, stopped };
 	}
 }
 
-/** Run one cascade search over `options.root`. Judge failures degrade coverage and are reported in `stats.failures`, never thrown. */
+/**
+ * Run one cascade search over `options.root`. Judge failures and an expired
+ * `deadline` degrade coverage and are reported in `stats.failures`, never thrown.
+ */
 export function runCascade(options: CascadeOptions): Promise<CascadeResult> {
 	return new Cascade(options).run();
 }
