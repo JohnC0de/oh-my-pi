@@ -267,6 +267,8 @@ class Cascade {
 		const plans = await Promise.all(
 			selected.map(async (node): Promise<FilePlan | undefined> => {
 				const entry = entries[node]!;
+				// Past the deadline only the leads are useful; reading would run into the hard stop.
+				if (this.#stopped) return undefined;
 				try {
 					const read = await readText(filesystem, entry.path, READ_LIMIT);
 					const passages = selectWindows(windows(read.text, WINDOW_BYTES, keywords, weights), WINDOWS);
@@ -385,7 +387,7 @@ class Cascade {
 		this.stats.filesRead += files.length - results.size;
 		hits.sort((a, b) => b.contentScore - a.contentScore);
 		const { requests, failed } = this.stats;
-		const stopped = this.#cut;
+		const stopped = this.#cut || this.#stopped;
 		const coverage: FindCoverage =
 			failed === 0 && !stopped ? "complete" : failed === requests ? "unavailable" : "partial";
 		const leads = selected.map(node => entries[node]!.rel);

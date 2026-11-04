@@ -130,7 +130,9 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 		} catch (error) {
 			if (deadline.aborted && !signal?.aborted) {
 				throw new ToolError(
-					`find timed out after ${formatDuration(FIND_TIMEOUT_MS)} before the lexical scan finished; use grep`,
+					hardStop.aborted
+						? `find timed out after ${formatDuration(FIND_TIMEOUT_MS + FIND_WRAP_UP_MS)} while reading candidate files; use grep`
+						: `find timed out after ${formatDuration(FIND_TIMEOUT_MS)} before the lexical scan finished; use grep`,
 				);
 			}
 			throw error;
@@ -179,7 +181,7 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 		if (coverage !== "complete" && hits.length === 0 && result.leads.length > 0) {
 			out.push(
 				"",
-				"leads (unjudged; strongest keyword and filename evidence first):",
+				"leads (no judged hit; strongest keyword and filename evidence first):",
 				...result.leads
 					.slice(0, LEADS_SHOWN)
 					.map(rel => `  ${formatPathRelativeToCwd(resolveSearchResultPath(root.path, rel), cwd)}`),

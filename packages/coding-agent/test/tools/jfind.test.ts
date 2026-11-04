@@ -374,7 +374,7 @@ describe("jfind cascade", () => {
 			});
 			const result = await tool.execute("x", { query: "token refresh", grep_keywords: ["refreshToken"] });
 			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
-			expect(text).toContain("leads (unjudged; strongest keyword and filename evidence first):\n  auth.ts");
+			expect(text).toContain("leads (no judged hit; strongest keyword and filename evidence first):\n  auth.ts");
 		} finally {
 			await removeWithRetries(dir);
 		}
